@@ -1,11 +1,15 @@
 """Read-only access to Mercora's synthetic customer/order operational data.
 
-`JsonCustomerOperationsStore` loads and validates the JSON fixtures in
-`data/` once at construction time, then serves lookups against the validated
-in-memory records. It is read-only: it never modifies fixture files, never
-mutates records, never writes JSON, and never makes an external call. All
-customer/order facts served to the workflow come from this deterministic
-dataset, never from the LLM.
+`load_customer_records`/`load_order_records` load and validate the JSON
+fixtures in `data/` - shared by `JsonCustomerOperationsStore` here and by
+`tools/action_store.py`'s simulated mutable store, so both build on the
+exact same validated loading/error behavior.
+
+`JsonCustomerOperationsStore` serves lookups against validated in-memory
+records loaded once at construction time. It is read-only: it never
+modifies fixture files, never mutates records, never writes JSON, and never
+makes an external call. All customer/order facts served to the workflow
+come from this deterministic dataset, never from the LLM.
 """
 
 from __future__ import annotations
@@ -64,6 +68,26 @@ def _load_json_array(path: Path, *, label: str) -> list[object]:
     return data
 
 
+def load_customer_records(path: Path | str | None = None) -> list[CustomerRecord]:
+    """Load and validate `data/customers.json` (or an injected path)."""
+    resolved_path = Path(path) if path is not None else DEFAULT_CUSTOMERS_PATH
+    raw_customers = _load_json_array(resolved_path, label="customers")
+    try:
+        return [CustomerRecord.model_validate(item) for item in raw_customers]
+    except ValidationError as exc:
+        raise DataStoreError(f"Invalid customer record in {resolved_path}: {exc}") from exc
+
+
+def load_order_records(path: Path | str | None = None) -> list[OrderRecord]:
+    """Load and validate `data/orders.json` (or an injected path)."""
+    resolved_path = Path(path) if path is not None else DEFAULT_ORDERS_PATH
+    raw_orders = _load_json_array(resolved_path, label="orders")
+    try:
+        return [OrderRecord.model_validate(item) for item in raw_orders]
+    except ValidationError as exc:
+        raise DataStoreError(f"Invalid order record in {resolved_path}: {exc}") from exc
+
+
 class JsonCustomerOperationsStore:
     """`CustomerOperationsStore` backed by the synthetic JSON fixtures.
 
@@ -77,21 +101,8 @@ class JsonCustomerOperationsStore:
         customers_path: Path | str | None = None,
         orders_path: Path | str | None = None,
     ) -> None:
-        customers_path = Path(customers_path) if customers_path is not None else DEFAULT_CUSTOMERS_PATH
-        orders_path = Path(orders_path) if orders_path is not None else DEFAULT_ORDERS_PATH
-
-        raw_customers = _load_json_array(customers_path, label="customers")
-        raw_orders = _load_json_array(orders_path, label="orders")
-
-        try:
-            customers = [CustomerRecord.model_validate(item) for item in raw_customers]
-        except ValidationError as exc:
-            raise DataStoreError(f"Invalid customer record in {customers_path}: {exc}") from exc
-
-        try:
-            orders = [OrderRecord.model_validate(item) for item in raw_orders]
-        except ValidationError as exc:
-            raise DataStoreError(f"Invalid order record in {orders_path}: {exc}") from exc
+        customers = load_customer_records(customers_path)
+        orders = load_order_records(orders_path)
 
         self._customers_by_id: dict[str, CustomerRecord] = {
             customer.customer_id: customer for customer in customers

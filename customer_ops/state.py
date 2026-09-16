@@ -34,6 +34,7 @@ WorkflowStatus = Literal[
     "clarification_required",
     "information_ready",
     "action_proposed",
+    "action_input_ready",
     "awaiting_approval",
     "blocked",
     "action_executed",
@@ -160,14 +161,17 @@ class CustomerOpsState(TypedDict):
     # Policy evaluation
     policy_assessment: NotRequired[dict[str, Any] | None]
 
-    # Routing and action proposal
+    # Routing, action proposal, and validated action input
     route: NotRequired[CaseRoute | None]
     proposed_action: NotRequired[dict[str, Any] | None]
+    action_input: NotRequired[dict[str, Any] | None]
 
     # Human-in-the-loop (future iterations)
     human_decision: NotRequired[HumanDecision | None]
 
-    # Execution outcome (future iterations)
+    # Execution outcome. Populated only for safe actions (cancel_order,
+    # change_address) executed against the simulated in-memory operational
+    # store - approval-required actions never execute in this iteration.
     action_result: NotRequired[dict[str, Any] | None]
 
     # Final output

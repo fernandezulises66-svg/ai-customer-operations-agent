@@ -2,36 +2,59 @@
 
 `intake` deterministically validates and normalizes the initial request.
 `classify_request` then makes one model-powered call, through the injectable
-`RequestClassifier` interface, to classify intent and urgency - this is the
-only step the LLM participates in. `load_context` deterministically
-retrieves the customer and their orders through the injectable
-`CustomerOperationsStore` interface. `resolve_order` deterministically
+`RequestClassifier` interface, to classify intent and urgency. `load_context`
+deterministically retrieves the customer and their orders through the
+injectable `CustomerOperationsStore` interface. `resolve_order` deterministically
 decides which (if any) of the customer's own orders the request refers to,
 never guessing. `evaluate_policy` deterministically evaluates explicit
 Mercora business rules against the resolved order.
 
 After policy evaluation, a genuine LangGraph conditional edge - driven only
-by structured state (`intent`, `order_resolution`, `policy_assessment`),
-never an LLM call - routes to one of five terminal branches: clarification,
-information, safe-action proposal, approval preparation, or blocked. A
-proposed action is a structured statement of operational *intent*, never
-execution - no business mutation happens yet.
+by structured state, never an LLM call - routes to one of five branches:
+
+- `clarification` / `information` / `blocked` are terminal, exactly as in
+  Iteration 5.
+- `action` (safe: cancel_order, address_change) additionally prepares
+  validated execution input (`prepare_action_input`, model-backed only for
+  `change_address`) and then, via a second conditional edge, either
+  executes the simulated mutation (`execute_safe_action`) or - if required
+  input is missing and was NOT invented - falls back to `clarification`.
+- `approval` (sensitive: issue_refund, investigate_billing,
+  investigate_product_issue) also prepares validated execution input for a
+  future human reviewer, but never executes in this iteration; it always
+  ends at `awaiting_approval`.
+
+Mutations run only against the in-memory simulated `CustomerActionStore` -
+`data/*.json` fixtures are never written to, and a successful mutation is
+synchronized back into `order_context` so graph state never shows stale
+data.
 
 Graph shape:
 START -> intake -> classify_request -> load_context -> resolve_order
       -> evaluate_policy -> (conditional) -> {clarification, information,
-         propose_action, prepare_approval, blocked} -> END
+         propose_action -> prepare_action_input -> (conditional) ->
+            {execute_safe_action, clarification},
+         prepare_approval -> prepare_approval_input,
+         blocked} -> END
 """
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from customer_ops.action_proposal import ActionProposalError, propose_action
+from customer_ops.action_executor import execute_action
+from customer_ops.action_inputs import (
+    ActionInputExtractor,
+    ActionInputResult,
+    OpenAIActionInputExtractor,
+    prepare_action_input,
+)
+from customer_ops.action_proposal import ActionProposalError, ProposedAction, propose_action
 from customer_ops.classifier import OpenAIRequestClassifier, RequestClassifier
 from customer_ops.order_resolution import OrderResolution, resolve_order
 from customer_ops.policies import PolicyAssessment, evaluate_policy
 from customer_ops.routing import determine_case_route
 from customer_ops.state import AuditEvent, CustomerOpsState
+from tools.action_store import CustomerActionStore, InMemoryCustomerActionStore
 from tools.customer_data import CustomerOperationsStore, JsonCustomerOperationsStore
 
 
@@ -241,15 +264,19 @@ def make_policy_router(router=determine_case_route):
 def make_clarification_node():
     """Build the `clarification` terminal branch node.
 
-    The workflow cannot proceed until the customer identifies the relevant
-    order. No order is guessed, no proposed action, no customer-facing
-    response - response generation arrives in a later iteration.
+    Reached either when order resolution could not identify the relevant
+    order, or when a safe action's required execution input turned out to
+    be missing (see `prepare_action_input`'s conditional edge) - in both
+    cases the specific reason was already recorded by the preceding audit
+    event, so this node's own message stays generic. No order is guessed,
+    no input is invented, no customer-facing response - response generation
+    arrives in a later iteration.
     """
 
     def clarification_node(state: CustomerOpsState) -> dict:
         audit_event: AuditEvent = {
             "step": "clarification",
-            "message": "Additional order identification is required.",
+            "message": "Additional information is required before this request can proceed.",
             "status": "ok",
         }
         return {
@@ -288,12 +315,12 @@ def make_information_node():
 
 
 def make_action_proposal_node(proposer=propose_action):
-    """Build the safe-action-proposal terminal branch node.
+    """Build the `propose_action` node for the safe-action branch.
 
     Only reached when policy outcome is `eligible` (e.g. cancel_order,
     address_change): proposes a structured `ProposedAction` describing what
-    *could* be done - it never executes it, and never invents action input
-    such as a new address.
+    *could* be done. Feeds into `prepare_action_input` next - this node
+    itself never executes anything and never invents action input.
     """
 
     def action_proposal_node(state: CustomerOpsState) -> dict:
@@ -322,13 +349,13 @@ def make_action_proposal_node(proposer=propose_action):
 
 
 def make_approval_preparation_node(proposer=propose_action):
-    """Build the approval-preparation terminal branch node.
+    """Build the `prepare_approval` node for the approval branch.
 
     Only reached when policy outcome is `review_required` (e.g.
     refund_request, billing_issue, product_issue): proposes a structured
-    `ProposedAction` with `requires_human_approval=True`. No interrupt, no
-    human decision, and no execution yet - those arrive in a later
-    iteration.
+    `ProposedAction` with `requires_human_approval=True`. Feeds into
+    `prepare_approval_input` next. No interrupt, no human decision, and no
+    execution yet - those arrive in a later iteration.
     """
 
     def approval_preparation_node(state: CustomerOpsState) -> dict:
@@ -354,6 +381,126 @@ def make_approval_preparation_node(proposer=propose_action):
         }
 
     return approval_preparation_node
+
+
+def make_action_input_node(extractor: ActionInputExtractor, preparer=prepare_action_input):
+    """Build the `prepare_action_input` node for the safe-action branch.
+
+    Deterministic and offline for `cancel_order`; calls `extractor` exactly
+    once for `change_address`. Does not itself finalize `route` or
+    `workflow_status` - the conditional edge that follows sends execution
+    to `execute_safe_action` (ready) or back to `clarification` (missing
+    input), and that destination node records the outcome.
+    """
+
+    def action_input_node(state: CustomerOpsState) -> dict:
+        proposed_action = ProposedAction.model_validate(state["proposed_action"])
+        result = preparer(proposed_action, state["customer_message"], extractor)
+
+        if result.ready:
+            message = f"Action input prepared for {result.action_type}."
+        else:
+            message = f"Additional action input is required: {', '.join(result.missing_fields)}."
+
+        audit_event: AuditEvent = {
+            "step": "action_input",
+            "message": message,
+            "status": "ok",
+        }
+
+        return {
+            "action_input": result.model_dump(mode="json"),
+            "workflow_status": "action_input_ready",
+            "audit_log": [*state.get("audit_log", []), audit_event],
+        }
+
+    return action_input_node
+
+
+def make_approval_action_input_node(extractor: ActionInputExtractor, preparer=prepare_action_input):
+    """Build the `prepare_approval_input` node for the approval branch.
+
+    Prepares the same validated execution input as `make_action_input_node`
+    so a future human reviewer knows exactly what operation is waiting -
+    but always finalizes the case at `awaiting_approval`. None of the three
+    approval-required action types ever need the model extractor or can be
+    "not ready", so no conditional branching is needed here.
+    """
+
+    def approval_action_input_node(state: CustomerOpsState) -> dict:
+        proposed_action = ProposedAction.model_validate(state["proposed_action"])
+        result = preparer(proposed_action, state["customer_message"], extractor)
+
+        audit_event: AuditEvent = {
+            "step": "action_input",
+            "message": "Action input prepared and awaiting human approval.",
+            "status": "ok",
+        }
+
+        return {
+            "action_input": result.model_dump(mode="json"),
+            "workflow_status": "awaiting_approval",
+            "audit_log": [*state.get("audit_log", []), audit_event],
+        }
+
+    return approval_action_input_node
+
+
+def _route_after_action_input(state: CustomerOpsState) -> str:
+    """Conditional-edge routing key for `prepare_action_input`.
+
+    A one-field read of `state["action_input"]["ready"]` - simple enough
+    that a dependency-injection wrapper would add ceremony without value.
+    """
+    return "ready" if state["action_input"]["ready"] else "missing"
+
+
+def make_safe_action_execution_node(action_store: CustomerActionStore, executor=execute_action):
+    """Build the `execute_safe_action` node.
+
+    Only reached when `prepare_action_input` reports `ready=True` on the
+    safe-action branch (`cancel_order`/`change_address` - never an
+    approval-required action type). Calls `executor` exactly once against
+    the simulated `action_store`, then re-reads the affected order from
+    that same store to synchronize `order_context` so graph state never
+    shows stale data. No other order is touched.
+    """
+
+    def execute_safe_action_node(state: CustomerOpsState) -> dict:
+        proposed_action = ProposedAction.model_validate(state["proposed_action"])
+        action_input = ActionInputResult.model_validate(state["action_input"])
+
+        result = executor(proposed_action, action_input, action_store, human_approved=False)
+        updated_order = action_store.get_order(result.order_id)
+
+        audit_event: AuditEvent = {
+            "step": "action_execution",
+            "message": result.message,
+            "status": "ok",
+        }
+
+        return {
+            "action_result": result.model_dump(mode="json"),
+            "order_context": _with_updated_order(state.get("order_context"), updated_order),
+            "workflow_status": "action_executed",
+            "audit_log": [*state.get("audit_log", []), audit_event],
+        }
+
+    return execute_safe_action_node
+
+
+def _with_updated_order(order_context, updated_order) -> dict:
+    """Replace one order's serialized entry inside `order_context`.
+
+    Leaves every other order untouched - never a cross-order mutation.
+    """
+    orders = (order_context or {}).get("orders", [])
+    updated_dict = updated_order.model_dump(mode="json")
+    new_orders = [
+        updated_dict if order.get("order_id") == updated_order.order_id else order
+        for order in orders
+    ]
+    return {"orders": new_orders, "count": len(new_orders)}
 
 
 def make_blocked_node():
@@ -383,28 +530,54 @@ def make_blocked_node():
 def build_customer_ops_graph(
     classifier: RequestClassifier | None = None,
     store: CustomerOperationsStore | None = None,
+    action_input_extractor: ActionInputExtractor | None = None,
+    action_store: CustomerActionStore | None = None,
 ) -> CompiledStateGraph:
     """Build and compile the Customer Operations graph.
 
     Current shape:
     START -> intake -> classify_request -> load_context -> resolve_order
-          -> evaluate_policy -> (conditional routing) -> one of
-             {clarification, propose_action, prepare_approval, information,
-             blocked} -> END.
+          -> evaluate_policy -> (conditional) -> one of:
+             - clarification -> END
+             - information -> END
+             - propose_action -> prepare_action_input -> (conditional) ->
+               execute_safe_action -> END, or clarification -> END
+             - prepare_approval -> prepare_approval_input -> END
+               (never executes)
+             - blocked -> END
 
-    Pass a fake `RequestClassifier` and/or `CustomerOperationsStore` (e.g. in
-    tests) to avoid any OpenAI dependency or real fixture files. Omitting
-    either uses the production defaults (`OpenAIRequestClassifier`,
-    `JsonCustomerOperationsStore`); building the graph loads and validates
-    the local JSON fixtures but makes no network call - only invoking the
-    graph as far as `classify_request` reaches OpenAI. Every node from
-    `resolve_order` onward, including the conditional edge itself, is
-    deterministic and never reaches the network.
+    Pass fakes for any of the four dependencies (e.g. in tests) to avoid any
+    OpenAI dependency or real fixture files. Omitting `classifier` or
+    `action_input_extractor` uses the real OpenAI-backed implementation;
+    building the graph never itself makes a network call - only invoking it
+    as far as `classify_request` or `prepare_action_input` (for
+    `change_address`) reaches OpenAI.
+
+    Store consistency: `store` (used for `load_context`) and `action_store`
+    (used for `execute_safe_action`) should be the SAME instance so a
+    single graph invocation reads and mutates one coherent snapshot rather
+    than two independently-loaded copies that could drift apart. When
+    both are omitted, this function constructs exactly one
+    `InMemoryCustomerActionStore.from_json()` and uses it for both -
+    `JsonCustomerOperationsStore` is used as the `store` default only when
+    `store` is customized without a matching `action_store` (or vice
+    versa), which is an intentionally narrow escape hatch, not the
+    recommended path.
     """
     if classifier is None:
         classifier = OpenAIRequestClassifier()
-    if store is None:
-        store = JsonCustomerOperationsStore()
+    if action_input_extractor is None:
+        action_input_extractor = OpenAIActionInputExtractor()
+
+    if store is None and action_store is None:
+        combined_store = InMemoryCustomerActionStore.from_json()
+        store = combined_store
+        action_store = combined_store
+    else:
+        if store is None:
+            store = JsonCustomerOperationsStore()
+        if action_store is None:
+            action_store = InMemoryCustomerActionStore.from_json()
 
     graph = StateGraph(CustomerOpsState)
     graph.add_node("intake", intake_node)
@@ -415,7 +588,10 @@ def build_customer_ops_graph(
     graph.add_node("clarification", make_clarification_node())
     graph.add_node("information", make_information_node())
     graph.add_node("propose_action", make_action_proposal_node())
+    graph.add_node("prepare_action_input", make_action_input_node(action_input_extractor))
+    graph.add_node("execute_safe_action", make_safe_action_execution_node(action_store))
     graph.add_node("prepare_approval", make_approval_preparation_node())
+    graph.add_node("prepare_approval_input", make_approval_action_input_node(action_input_extractor))
     graph.add_node("blocked", make_blocked_node())
 
     graph.add_edge(START, "intake")
@@ -434,9 +610,16 @@ def build_customer_ops_graph(
             "blocked": "blocked",
         },
     )
+    graph.add_edge("propose_action", "prepare_action_input")
+    graph.add_conditional_edges(
+        "prepare_action_input",
+        _route_after_action_input,
+        {"ready": "execute_safe_action", "missing": "clarification"},
+    )
+    graph.add_edge("execute_safe_action", END)
+    graph.add_edge("prepare_approval", "prepare_approval_input")
+    graph.add_edge("prepare_approval_input", END)
     graph.add_edge("clarification", END)
     graph.add_edge("information", END)
-    graph.add_edge("propose_action", END)
-    graph.add_edge("prepare_approval", END)
     graph.add_edge("blocked", END)
     return graph.compile()

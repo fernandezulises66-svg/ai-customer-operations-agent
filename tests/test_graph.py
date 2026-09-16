@@ -2,23 +2,32 @@
 
 These tests cover our own behavior (validation, normalization, classification
 wiring, context loading, order resolution, policy evaluation, conditional
-routing, action proposal, audit logging, workflow status) - not LangGraph
-internals. No test makes a network or OpenAI API call: `classify_request` is
-always exercised through `FakeRequestClassifier` and `load_context` through
-`FakeCustomerOperationsStore`, both deterministic test doubles defined below.
-`resolve_order`, `evaluate_policy`, routing, and action proposal are already
-fully deterministic and offline, so the real implementations are used
-directly.
+routing, action proposal, action-input preparation, simulated execution,
+audit logging, workflow status) - not LangGraph internals. No test makes a
+network or OpenAI API call: `classify_request` is always exercised through
+`FakeRequestClassifier`, `load_context` through `FakeCustomerOperationsStore`
+(or `InMemoryCustomerActionStore` for tests that also need mutation), and
+`change_address` input extraction through `FakeActionInputExtractor` - all
+deterministic test doubles defined below. `resolve_order`, `evaluate_policy`,
+routing, action proposal, and action execution are already fully
+deterministic and offline, so the real implementations are used directly.
 """
 
 import json
 
 import pytest
 
+from customer_ops.action_inputs import AddressExtraction
 from customer_ops.classifier import ClassificationDecision, ClassificationError
 from customer_ops.graph import InvalidCustomerRequest, build_customer_ops_graph
 from customer_ops.models import CustomerRecord, OrderRecord
-from tools.customer_data import CustomerNotFoundError, OrderNotFoundError
+from tools.action_store import InMemoryCustomerActionStore
+from tools.customer_data import (
+    DEFAULT_CUSTOMERS_PATH,
+    DEFAULT_ORDERS_PATH,
+    CustomerNotFoundError,
+    OrderNotFoundError,
+)
 
 
 class FakeRequestClassifier:
@@ -81,6 +90,22 @@ class FakeCustomerOperationsStore:
         raise OrderNotFoundError(f"No order found with order_id={order_id!r}") from None
 
 
+class FakeActionInputExtractor:
+    """Deterministic `ActionInputExtractor` test double.
+
+    Returns `address` (possibly `None`) for every `change_address` proposal
+    and records every message it was asked to extract from.
+    """
+
+    def __init__(self, address: str | None = None):
+        self.address = address
+        self.calls: list[str] = []
+
+    def extract_new_shipping_address(self, customer_message: str) -> AddressExtraction:
+        self.calls.append(customer_message)
+        return AddressExtraction(new_shipping_address=self.address)
+
+
 def make_customer(customer_id="cust-001", **overrides) -> CustomerRecord:
     fields = {
         "customer_id": customer_id,
@@ -121,10 +146,30 @@ def default_store() -> FakeCustomerOperationsStore:
     )
 
 
-def make_graph(classifier=None, store=None):
+def make_action_store(
+    customers: dict[str, CustomerRecord],
+    orders_by_customer: dict[str, list[OrderRecord]] | None = None,
+) -> InMemoryCustomerActionStore:
+    """A combined read+mutate store for tests that reach action execution.
+
+    Takes the same customers/orders_by_customer shape as
+    `FakeCustomerOperationsStore` so tests can switch between the two, but
+    returns the real `InMemoryCustomerActionStore` - the one class that
+    implements both the read protocol `load_context` needs and the
+    mutation protocol `execute_safe_action` needs against the SAME
+    in-memory records, exactly as production does by default.
+    """
+    orders_by_customer = orders_by_customer or {}
+    all_orders = [order for orders in orders_by_customer.values() for order in orders]
+    return InMemoryCustomerActionStore(customers=list(customers.values()), orders=all_orders)
+
+
+def make_graph(classifier=None, store=None, action_input_extractor=None, action_store=None):
     return build_customer_ops_graph(
         classifier or FakeRequestClassifier(),
         store or default_store(),
+        action_input_extractor or FakeActionInputExtractor(),
+        action_store,
     )
 
 
@@ -571,12 +616,12 @@ def test_order_resolution_audit_event_appended():
 
 
 def test_policy_assessment_populated():
-    store = FakeCustomerOperationsStore(
+    store = make_action_store(
         customers={"cust-777": make_customer("cust-777")},
         orders_by_customer={"cust-777": [make_order("order-aaa", "cust-777", status="pending")]},
     )
     classifier = FakeRequestClassifier(intent="cancel_order", urgency="medium")
-    graph = make_graph(classifier, store)
+    graph = make_graph(classifier, store, action_store=store)
     result = graph.invoke(
         {
             "request_id": "req-001",
@@ -696,14 +741,14 @@ def test_information_branch_for_order_status_with_explicit_order():
     assert result["audit_log"][-1]["step"] == "information"
 
 
-def test_action_branch_for_eligible_cancel_order():
+def test_safe_cancellation_executes_and_updates_order_state():
     order = make_order("order-aaa", "cust-777", status="pending")
-    store = FakeCustomerOperationsStore(
+    store = make_action_store(
         customers={"cust-777": make_customer("cust-777")},
         orders_by_customer={"cust-777": [order]},
     )
     classifier = FakeRequestClassifier(intent="cancel_order", urgency="medium")
-    graph = make_graph(classifier, store)
+    graph = make_graph(classifier, store, action_store=store)
     result = graph.invoke(
         {
             "request_id": "req-001",
@@ -717,10 +762,82 @@ def test_action_branch_for_eligible_cancel_order():
         "order_id": "order-aaa",
         "requires_human_approval": False,
     }
-    assert result["workflow_status"] == "action_proposed"
-    assert result["audit_log"][-1]["step"] == "action_proposal"
-    # The order itself was never mutated - only a proposal was recorded.
-    assert result["order_context"] == {"orders": [order.model_dump(mode="json")], "count": 1}
+    assert result["action_input"] == {
+        "ready": True,
+        "action_type": "cancel_order",
+        "parameters": {"order_id": "order-aaa"},
+        "missing_fields": [],
+    }
+    assert result["action_result"]["success"] is True
+    assert result["action_result"]["action_type"] == "cancel_order"
+    assert result["action_result"]["order_id"] == "order-aaa"
+    assert result["workflow_status"] == "action_executed"
+    # State was synchronized: the order in context now shows the new status,
+    # and it is the only order that changed.
+    assert result["order_context"]["count"] == 1
+    assert result["order_context"]["orders"][0]["status"] == "cancelled"
+    assert [event["step"] for event in result["audit_log"]] == [
+        "intake",
+        "classification",
+        "context_loading",
+        "order_resolution",
+        "policy_evaluation",
+        "action_proposal",
+        "action_input",
+        "action_execution",
+    ]
+
+
+def test_address_change_with_explicit_address_executes():
+    order = make_order("order-aaa", "cust-777", status="processing", shipping_address="Old address")
+    store = make_action_store(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={"cust-777": [order]},
+    )
+    new_address = "Calle Falsa 123, Cordoba"
+    extractor = FakeActionInputExtractor(address=new_address)
+    classifier = FakeRequestClassifier(intent="address_change", urgency="medium")
+    graph = make_graph(classifier, store, action_input_extractor=extractor, action_store=store)
+    result = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": f"Please change the address on order-aaa to {new_address}.",
+        }
+    )
+    assert result["route"] == "action"
+    assert result["action_result"]["success"] is True
+    assert result["action_result"]["action_type"] == "change_address"
+    assert result["workflow_status"] == "action_executed"
+    assert result["order_context"]["orders"][0]["shipping_address"] == new_address
+    assert extractor.calls == [f"Please change the address on order-aaa to {new_address}."]
+
+
+def test_address_change_without_new_address_requires_clarification():
+    order = make_order("order-aaa", "cust-777", status="processing", shipping_address="Old address")
+    store = make_action_store(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={"cust-777": [order]},
+    )
+    extractor = FakeActionInputExtractor(address=None)
+    classifier = FakeRequestClassifier(intent="address_change", urgency="medium")
+    graph = make_graph(classifier, store, action_input_extractor=extractor, action_store=store)
+    result = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "Please change the address on order-aaa.",
+        }
+    )
+    assert result["route"] == "clarification"
+    assert result["workflow_status"] == "clarification_required"
+    assert "action_result" not in result
+    assert result["action_input"]["ready"] is False
+    assert result["action_input"]["missing_fields"] == ["new_shipping_address"]
+    # Nothing was invented and the order was never mutated.
+    assert result["order_context"]["orders"][0]["shipping_address"] == "Old address"
+    # The proposal is preserved for traceability even though it did not execute.
+    assert result["proposed_action"]["action_type"] == "change_address"
 
 
 def test_approval_branch_for_refund_on_delivered_paid_order():
@@ -744,10 +861,126 @@ def test_approval_branch_for_refund_on_delivered_paid_order():
         "order_id": "order-aaa",
         "requires_human_approval": True,
     }
+    assert result["action_input"] == {
+        "ready": True,
+        "action_type": "issue_refund",
+        "parameters": {"order_id": "order-aaa"},
+        "missing_fields": [],
+    }
     assert result["workflow_status"] == "awaiting_approval"
-    assert result["audit_log"][-1]["step"] == "approval_required"
+    assert result["audit_log"][-1]["step"] == "action_input"
     assert "human_decision" not in result
     assert "action_result" not in result
+    # No execution occurred - payment_status remains exactly as it was.
+    assert result["order_context"]["orders"][0]["payment_status"] == "paid"
+
+
+def test_billing_issue_approval_branch_does_not_execute():
+    order = make_order("order-aaa", "cust-777", status="delivered")
+    store = FakeCustomerOperationsStore(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={"cust-777": [order]},
+    )
+    classifier = FakeRequestClassifier(intent="billing_issue", urgency="high")
+    graph = make_graph(classifier, store)
+    result = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "I was charged twice for order-aaa.",
+        }
+    )
+    assert result["route"] == "approval"
+    assert result["workflow_status"] == "awaiting_approval"
+    assert result["action_input"]["action_type"] == "investigate_billing"
+    assert "action_result" not in result
+    assert "human_decision" not in result
+
+
+def test_product_issue_approval_branch_does_not_execute():
+    order = make_order("order-aaa", "cust-777", status="delivered")
+    store = FakeCustomerOperationsStore(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={"cust-777": [order]},
+    )
+    classifier = FakeRequestClassifier(intent="product_issue", urgency="medium")
+    graph = make_graph(classifier, store)
+    result = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "The item in order-aaa arrived broken.",
+        }
+    )
+    assert result["route"] == "approval"
+    assert result["workflow_status"] == "awaiting_approval"
+    assert result["action_input"]["action_type"] == "investigate_product_issue"
+    assert "action_result" not in result
+    assert "human_decision" not in result
+
+
+def test_audit_log_does_not_contain_new_shipping_address():
+    order = make_order("order-aaa", "cust-777", status="processing", shipping_address="Old address")
+    store = make_action_store(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={"cust-777": [order]},
+    )
+    new_address = "900 Confidential Ave, Privacy City, PC 00001, USA"
+    extractor = FakeActionInputExtractor(address=new_address)
+    classifier = FakeRequestClassifier(intent="address_change", urgency="medium")
+    graph = make_graph(classifier, store, action_input_extractor=extractor, action_store=store)
+    result = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": f"Please change the address on order-aaa to {new_address}.",
+        }
+    )
+    for event in result["audit_log"]:
+        assert new_address not in event["message"]
+
+
+def test_action_execution_makes_no_network_calls(no_network):
+    order = make_order("order-aaa", "cust-777", status="pending")
+    store = make_action_store(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={"cust-777": [order]},
+    )
+    classifier = FakeRequestClassifier(intent="cancel_order", urgency="medium")
+    graph = make_graph(classifier, store, action_store=store)
+    result = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "Please cancel order-aaa.",
+        }
+    )
+    assert result["workflow_status"] == "action_executed"
+
+
+def test_graph_execution_does_not_modify_real_fixture_files():
+    customers_before = DEFAULT_CUSTOMERS_PATH.read_text(encoding="utf-8")
+    orders_before = DEFAULT_ORDERS_PATH.read_text(encoding="utf-8")
+
+    action_store = InMemoryCustomerActionStore.from_json()
+    classifier = FakeRequestClassifier(intent="cancel_order", urgency="medium")
+    graph = build_customer_ops_graph(
+        classifier=classifier,
+        store=action_store,
+        action_input_extractor=FakeActionInputExtractor(),
+        action_store=action_store,
+    )
+    # order-1004 is 'processing' for cust-002 in the real fixture - eligible.
+    graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-002",
+            "customer_message": "Please cancel order-1004.",
+        }
+    )
+
+    assert DEFAULT_CUSTOMERS_PATH.read_text(encoding="utf-8") == customers_before
+    assert DEFAULT_ORDERS_PATH.read_text(encoding="utf-8") == orders_before
 
 
 def test_blocked_branch_for_address_change_on_shipped_order():
@@ -802,12 +1035,12 @@ def test_routed_results_are_json_serializable_and_deterministic(
 ):
     def build_graph():
         order = make_order("order-aaa", "cust-777", status=order_status, payment_status=payment_status)
-        store = FakeCustomerOperationsStore(
+        store = make_action_store(
             customers={"cust-777": make_customer("cust-777")},
             orders_by_customer={"cust-777": [order]},
         )
         classifier = FakeRequestClassifier(intent=intent, urgency="medium")
-        return make_graph(classifier, store)
+        return make_graph(classifier, store, action_store=store)
 
     payload = {"request_id": "req-001", "customer_id": "cust-777", "customer_message": message}
     result_a = build_graph().invoke(dict(payload))

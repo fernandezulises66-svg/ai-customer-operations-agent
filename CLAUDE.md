@@ -77,6 +77,26 @@ Guidance for Claude Code (and any future contributor) working in this repository
 - Human-approval state must never be fabricated: `requires_human_approval`
   is a policy/action output, but a human decision (`human_decision`) must
   never be set except by an actual future approval step.
+- Execution must use explicit, validated action inputs (e.g.
+  `ActionInputResult`/one Pydantic model per action type) - never a raw or
+  arbitrary dict payload.
+- A missing action input (e.g. a replacement address the customer never
+  supplied) must never be invented, autocompleted, or guessed - it becomes
+  an explicit "not ready"/clarification-required outcome instead.
+- Approval-required execution requires explicit approval at the executor
+  boundary itself (e.g. `human_approved=True`), enforced even if upstream
+  routing already prevents reaching it - defense in depth, not a single
+  point of failure.
+- Business-store mutation is simulated and in-memory only; it must never
+  write to the synthetic JSON fixtures or any real external system.
+  Mutation (`tools/action_store.py`) and fixture persistence
+  (`data/*.json`, loaded by `tools/customer_data.py`) are separate
+  concerns - fixtures are example source data, not mutable business
+  storage.
+- After a successful simulated mutation, graph state must be
+  resynchronized (e.g. re-read the affected order and replace it in
+  `order_context`) so state never shows stale data - and only the affected
+  record changes, never an unrelated one.
 
 ## Language
 
