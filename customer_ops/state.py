@@ -29,6 +29,7 @@ WorkflowStatus = Literal[
     "received",
     "classified",
     "context_loaded",
+    "order_resolved",
     "policy_checked",
     "action_proposed",
     "awaiting_approval",
@@ -40,6 +41,33 @@ WorkflowStatus = Literal[
 
 HumanDecision = Literal["approved", "rejected"]
 
+OrderResolutionStatus = Literal["selected", "not_required", "needs_clarification"]
+
+PolicyOutcome = Literal[
+    "information_only",
+    "eligible",
+    "blocked",
+    "review_required",
+    "needs_clarification",
+    "not_applicable",
+]
+
+# Stable, machine-readable policy codes. See customer_ops/policies.py for the
+# rules that produce each one.
+PolicyCode = Literal[
+    "ORDER_STATUS_INFO",
+    "CANCEL_ALLOWED",
+    "CANCEL_BLOCKED_STATUS",
+    "ADDRESS_CHANGE_ALLOWED",
+    "ADDRESS_CHANGE_BLOCKED_STATUS",
+    "REFUND_REVIEW_REQUIRED",
+    "ALREADY_REFUNDED",
+    "BILLING_REVIEW_REQUIRED",
+    "PRODUCT_REVIEW_REQUIRED",
+    "ORDER_REQUIRED",
+    "NOT_APPLICABLE",
+]
+
 # Documented value sets, derived from the Literals above so the two never
 # drift apart. Useful for validation and for tests that assert on the
 # controlled vocabulary without duplicating it.
@@ -47,6 +75,9 @@ INTENT_VALUES: tuple[str, ...] = get_args(Intent)
 URGENCY_VALUES: tuple[str, ...] = get_args(Urgency)
 WORKFLOW_STATUS_VALUES: tuple[str, ...] = get_args(WorkflowStatus)
 HUMAN_DECISION_VALUES: tuple[str, ...] = get_args(HumanDecision)
+ORDER_RESOLUTION_STATUS_VALUES: tuple[str, ...] = get_args(OrderResolutionStatus)
+POLICY_OUTCOME_VALUES: tuple[str, ...] = get_args(PolicyOutcome)
+POLICY_CODE_VALUES: tuple[str, ...] = get_args(PolicyCode)
 
 
 # --- Audit trail --------------------------------------------------------------
@@ -102,8 +133,14 @@ class CustomerOpsState(TypedDict):
     customer_context: NotRequired[dict[str, Any] | None]
     order_context: NotRequired[OrderContext | None]
 
-    # Policy and action planning (future iterations)
+    # Order resolution
+    selected_order_id: NotRequired[str | None]
+    order_resolution: NotRequired[dict[str, Any] | None]
+
+    # Policy evaluation
     policy_assessment: NotRequired[dict[str, Any] | None]
+
+    # Action planning (future iterations)
     proposed_action: NotRequired[dict[str, Any] | None]
 
     # Human-in-the-loop (future iterations)

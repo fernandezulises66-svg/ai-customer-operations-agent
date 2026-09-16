@@ -1,10 +1,13 @@
 """Tests for the Customer Operations LangGraph workflow.
 
 These tests cover our own behavior (validation, normalization, classification
-wiring, context loading, audit logging, workflow status) - not LangGraph
-internals. No test makes a network or OpenAI API call: `classify_request` is
-always exercised through `FakeRequestClassifier` and `load_context` through
+wiring, context loading, order resolution, policy evaluation, audit logging,
+workflow status) - not LangGraph internals. No test makes a network or
+OpenAI API call: `classify_request` is always exercised through
+`FakeRequestClassifier` and `load_context` through
 `FakeCustomerOperationsStore`, both deterministic test doubles defined below.
+`resolve_order` and `evaluate_policy` are already fully deterministic and
+offline, so the real implementations are used directly.
 """
 
 import json
@@ -129,7 +132,7 @@ def test_graph_builds_with_injected_classifier_and_store():
     assert graph is not None
 
 
-def test_valid_request_reaches_context_loaded_status():
+def test_valid_request_reaches_policy_checked_status():
     graph = make_graph()
     result = graph.invoke(
         {
@@ -138,7 +141,7 @@ def test_valid_request_reaches_context_loaded_status():
             "customer_message": "Quiero saber donde esta mi pedido.",
         }
     )
-    assert result["workflow_status"] == "context_loaded"
+    assert result["workflow_status"] == "policy_checked"
 
 
 def test_customer_message_is_trimmed():
@@ -179,7 +182,7 @@ def test_request_id_and_customer_id_are_preserved():
     assert result["customer_id"] == "cust-042"
 
 
-def test_no_policy_or_action_state_is_fabricated():
+def test_no_action_or_response_state_is_fabricated():
     graph = make_graph()
     result = graph.invoke(
         {
@@ -188,10 +191,11 @@ def test_no_policy_or_action_state_is_fabricated():
             "customer_message": "Where is my order?",
         }
     )
-    assert "policy_assessment" not in result
     assert "proposed_action" not in result
     assert "human_decision" not in result
     assert "action_result" not in result
+    assert "final_response" not in result
+    assert "escalation_reason" not in result
 
 
 def test_empty_message_is_rejected():
@@ -260,7 +264,7 @@ def test_graph_invocation_makes_no_network_calls(no_network):
             "customer_message": "Where is my order?",
         }
     )
-    assert result["workflow_status"] == "context_loaded"
+    assert result["workflow_status"] == "policy_checked"
 
 
 def test_state_contains_only_json_friendly_data():
@@ -438,7 +442,6 @@ def test_context_loading_audit_event_appended():
             "customer_message": "Where is my order?",
         }
     )
-    assert len(result["audit_log"]) == 3
     assert result["audit_log"][2]["step"] == "context_loading"
     assert result["audit_log"][2]["status"] == "ok"
     assert result["audit_log"][2]["message"] == "Loaded customer context and 1 order records."
@@ -494,5 +497,151 @@ def test_customer_with_zero_orders_is_valid():
             "customer_message": "Where is my order?",
         }
     )
-    assert result["workflow_status"] == "context_loaded"
+    assert result["workflow_status"] == "policy_checked"
     assert result["order_context"] == {"orders": [], "count": 0}
+    assert result["order_resolution"]["status"] == "needs_clarification"
+
+
+# --- resolve_order node -----------------------------------------------------
+
+
+def test_explicit_known_order_id_reaches_selected_order_id():
+    store = FakeCustomerOperationsStore(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={
+            "cust-777": [make_order("order-aaa", "cust-777"), make_order("order-bbb", "cust-777")]
+        },
+    )
+    classifier = FakeRequestClassifier(intent="order_status", urgency="low")
+    graph = make_graph(classifier, store)
+    result = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "Can you tell me the status of order-aaa?",
+        }
+    )
+    assert result["selected_order_id"] == "order-aaa"
+    assert result["order_resolution"]["status"] == "selected"
+
+
+def test_no_order_id_produces_needs_clarification():
+    store = FakeCustomerOperationsStore(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={
+            "cust-777": [make_order("order-aaa", "cust-777"), make_order("order-bbb", "cust-777")]
+        },
+    )
+    classifier = FakeRequestClassifier(intent="order_status", urgency="low")
+    graph = make_graph(classifier, store)
+    result = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "Where is my order?",
+        }
+    )
+    assert result["selected_order_id"] is None
+    assert result["order_resolution"]["status"] == "needs_clarification"
+
+
+def test_order_resolution_audit_event_appended():
+    store = FakeCustomerOperationsStore(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={"cust-777": [make_order("order-aaa", "cust-777")]},
+    )
+    classifier = FakeRequestClassifier(intent="order_status", urgency="low")
+    graph = make_graph(classifier, store)
+    result = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "Status of order-aaa please.",
+        }
+    )
+    assert result["audit_log"][3]["step"] == "order_resolution"
+    assert result["audit_log"][3]["status"] == "ok"
+    assert "order-aaa" in result["audit_log"][3]["message"]
+
+
+# --- evaluate_policy node ----------------------------------------------------
+
+
+def test_policy_assessment_populated():
+    store = FakeCustomerOperationsStore(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={"cust-777": [make_order("order-aaa", "cust-777", status="pending")]},
+    )
+    classifier = FakeRequestClassifier(intent="cancel_order", urgency="medium")
+    graph = make_graph(classifier, store)
+    result = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "Please cancel order-aaa.",
+        }
+    )
+    assert result["policy_assessment"]["outcome"] == "eligible"
+    assert result["policy_assessment"]["requires_human_approval"] is False
+    assert result["policy_assessment"]["policy_code"] == "CANCEL_ALLOWED"
+
+
+def test_policy_evaluation_audit_event_appended():
+    store = FakeCustomerOperationsStore(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={"cust-777": [make_order("order-aaa", "cust-777", status="shipped")]},
+    )
+    classifier = FakeRequestClassifier(intent="order_status", urgency="low")
+    graph = make_graph(classifier, store)
+    result = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "Status of order-aaa please.",
+        }
+    )
+    assert result["audit_log"][4]["step"] == "policy_evaluation"
+    assert result["audit_log"][4]["status"] == "ok"
+    assert "information_only" in result["audit_log"][4]["message"]
+
+
+def test_exactly_five_workflow_audit_stages():
+    store = FakeCustomerOperationsStore(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={"cust-777": [make_order("order-aaa", "cust-777", status="shipped")]},
+    )
+    classifier = FakeRequestClassifier(intent="order_status", urgency="low")
+    graph = make_graph(classifier, store)
+    result = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "Status of order-aaa please.",
+        }
+    )
+    assert [event["step"] for event in result["audit_log"]] == [
+        "intake",
+        "classification",
+        "context_loading",
+        "order_resolution",
+        "policy_evaluation",
+    ]
+
+
+def test_customer_and_order_facts_unchanged_after_policy_evaluation():
+    customer = make_customer("cust-777")
+    order = make_order("order-aaa", "cust-777", status="shipped")
+    store = FakeCustomerOperationsStore(
+        customers={"cust-777": customer}, orders_by_customer={"cust-777": [order]}
+    )
+    classifier = FakeRequestClassifier(intent="order_status", urgency="low")
+    graph = make_graph(classifier, store)
+    result = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "Status of order-aaa please.",
+        }
+    )
+    assert result["customer_context"] == customer.model_dump(mode="json")
+    assert result["order_context"] == {"orders": [order.model_dump(mode="json")], "count": 1}

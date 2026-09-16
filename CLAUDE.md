@@ -54,6 +54,19 @@ Guidance for Claude Code (and any future contributor) working in this repository
 - Read-only and mutating operational tools must stay clearly separated
   (e.g. `tools/customer_data.py` is read-only; simulated mutations belong in
   their own future module and require human approval).
+- Business eligibility (whether an action is allowed, which order a request
+  refers to) must be decided by deterministic policy code, never LLM
+  improvisation. The LLM interprets intent/urgency only.
+- Ambiguous operational targets (e.g. which order a message refers to) must
+  not be guessed. Conservative deterministic logic should prefer an
+  explicit "needs clarification" business outcome over a plausible-looking
+  guess.
+- A human-approval requirement is a policy *output* (e.g.
+  `requires_human_approval` on a policy assessment); actually pausing for
+  and acting on that approval is a separate, later workflow step.
+- Technical/state-corruption errors (e.g. a referenced order absent from
+  the customer's own scoped context) must raise a domain exception, never
+  silently resolve to a valid-looking business outcome.
 
 ## Language
 

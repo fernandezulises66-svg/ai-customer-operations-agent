@@ -11,6 +11,9 @@ from customer_ops.state import (
     CustomerOpsState,
     HUMAN_DECISION_VALUES,
     INTENT_VALUES,
+    ORDER_RESOLUTION_STATUS_VALUES,
+    POLICY_CODE_VALUES,
+    POLICY_OUTCOME_VALUES,
     URGENCY_VALUES,
     WORKFLOW_STATUS_VALUES,
 )
@@ -37,6 +40,7 @@ def test_workflow_status_values_are_the_documented_set():
         "received",
         "classified",
         "context_loaded",
+        "order_resolved",
         "policy_checked",
         "action_proposed",
         "awaiting_approval",
@@ -49,6 +53,37 @@ def test_workflow_status_values_are_the_documented_set():
 
 def test_human_decision_values_are_the_documented_set():
     assert set(HUMAN_DECISION_VALUES) == {"approved", "rejected"}
+
+
+def test_order_resolution_status_values_are_the_documented_set():
+    assert set(ORDER_RESOLUTION_STATUS_VALUES) == {"selected", "not_required", "needs_clarification"}
+
+
+def test_policy_outcome_values_are_the_documented_set():
+    assert set(POLICY_OUTCOME_VALUES) == {
+        "information_only",
+        "eligible",
+        "blocked",
+        "review_required",
+        "needs_clarification",
+        "not_applicable",
+    }
+
+
+def test_policy_code_values_are_the_documented_set():
+    assert set(POLICY_CODE_VALUES) == {
+        "ORDER_STATUS_INFO",
+        "CANCEL_ALLOWED",
+        "CANCEL_BLOCKED_STATUS",
+        "ADDRESS_CHANGE_ALLOWED",
+        "ADDRESS_CHANGE_BLOCKED_STATUS",
+        "REFUND_REVIEW_REQUIRED",
+        "ALREADY_REFUNDED",
+        "BILLING_REVIEW_REQUIRED",
+        "PRODUCT_REVIEW_REQUIRED",
+        "ORDER_REQUIRED",
+        "NOT_APPLICABLE",
+    }
 
 
 def test_audit_event_accepts_required_and_optional_fields():
