@@ -1,7 +1,7 @@
 # AI Customer Operations Agent
 
-**Status: foundation only (Iteration 1).** This is a portfolio project and is
-not production software.
+**Status: request intake + structured classification (Iteration 2).** This is
+a portfolio project and is not production software.
 
 > Mercora is a fictional e-commerce company invented for this project. All
 > customers, orders, policies, payments, addresses, and tickets referenced
@@ -37,7 +37,9 @@ observability.
   routing directly — no LangChain agents, `create_agent`, CrewAI, AutoGen, or
   n8n.
 - The **OpenAI SDK** is called directly inside specific graph nodes that need
-  LLM reasoning; LangGraph orchestrates, it does not hide business logic.
+  LLM reasoning, using the Responses API's Structured Outputs mechanism
+  rather than free-form text parsing; LangGraph orchestrates, it does not
+  hide business logic.
 - **Tools** (`tools/`) are narrow, independently testable functions used by
   graph nodes.
 - Sensitive/high-impact simulated actions require a **human-in-the-loop**
@@ -45,27 +47,44 @@ observability.
 - The workflow state is checkpoint-friendly and produces a **structured audit
   trail** of observable events (not model reasoning).
 
-## Current implementation (Iteration 1: Project Foundation and LangGraph State)
+## Current implementation (Iteration 2: Structured Request Classification)
 
 Implemented now:
 
-- Project scaffold (`customer_ops/`, `tools/`, `data/`, `evals/`, `tests/`).
 - Typed workflow state (`customer_ops/state.py`): `CustomerOpsState`,
   `AuditEvent`, and controlled `Literal` vocabularies for intent, urgency,
   workflow status, and human decision.
-- A single deterministic node, `intake_node`, that validates and normalizes
+- Deterministic intake validation (`intake_node`): validates and normalizes
   the initial request (`request_id`, `customer_id`, `customer_message`),
   sets `workflow_status` to `"received"`, and appends one audit event. It
   makes no LLM calls and infers nothing.
-- A minimal compiled LangGraph workflow: `START -> intake -> END`, built via
-  `build_customer_ops_graph()`.
+- Structured OpenAI request classification (`customer_ops/classifier.py`):
+  a single call to the OpenAI Responses API **Structured Outputs**
+  mechanism (`client.responses.parse(..., text_format=ClassificationDecision)`)
+  classifies intent and urgency from `ClassificationDecision`, a Pydantic
+  model with exactly those two controlled fields - no free-form JSON
+  parsing, no chain-of-thought, no confidence score.
+  - Intent classification into the controlled `Intent` vocabulary.
+  - Urgency classification into the controlled `Urgency` vocabulary.
+  - Understands both Spanish and English customer messages; the controlled
+    output vocabulary never changes with input language.
+  - Injectable classifier dependency: the graph node depends on the
+    `RequestClassifier` protocol, not the OpenAI SDK directly, so tests
+    inject a deterministic fake and production injects
+    `OpenAIRequestClassifier`.
+  - Classification failures raise `ClassificationError` and are never
+    silently turned into a business decision (e.g. intent `"other"` is a
+    real model classification, not an error fallback).
+- LangGraph workflow: `START -> intake -> classify_request -> END`, built via
+  `build_customer_ops_graph(classifier=None)`.
 - A minimal `app.py` placeholder entry point (no CLI, no OpenAI call).
-- Unit tests for state contracts and graph behavior.
+- Unit tests for state contracts, the classifier, and graph behavior - all
+  running with no network access and no API key.
 
 Planned later (not implemented yet):
 
-- LLM-based request classification (intent, urgency).
-- Operational tools (customer lookup, order lookup, etc.).
+- Synthetic customer/order data and lookup tools.
+- Operational tools (`tools/`).
 - Policy evaluation logic.
 - Conditional routing between workflow branches.
 - Human-in-the-loop approval gate.
@@ -80,8 +99,8 @@ Planned later (not implemented yet):
 - Python 3.13+
 - [LangGraph](https://github.com/langchain-ai/langgraph) `>=1.1,<2.0` for
   orchestration
-- [OpenAI SDK](https://github.com/openai/openai-python) `>=3.0,<4.0` (not yet
-  called in this iteration)
+- [OpenAI SDK](https://github.com/openai/openai-python) `>=3.0,<4.0`, used via
+  the Responses API structured-output path (`responses.parse`)
 - [Pydantic](https://github.com/pydantic/pydantic) `>=2.0,<3.0`
 - [python-dotenv](https://github.com/theskumar/python-dotenv) for local
   environment configuration
@@ -94,8 +113,9 @@ ai-customer-operations-agent/
 │
 ├── customer_ops/
 │   ├── __init__.py
-│   ├── state.py        # CustomerOpsState, AuditEvent, controlled vocabularies
-│   └── graph.py         # intake_node, build_customer_ops_graph()
+│   ├── state.py          # CustomerOpsState, AuditEvent, controlled vocabularies
+│   ├── classifier.py     # ClassificationDecision, RequestClassifier, OpenAIRequestClassifier
+│   └── graph.py          # intake_node, classify_request node, build_customer_ops_graph()
 │
 ├── tools/
 │   └── __init__.py      # empty in Iteration 1
@@ -108,7 +128,9 @@ ai-customer-operations-agent/
 │
 ├── tests/
 │   ├── __init__.py
+│   ├── conftest.py
 │   ├── test_state.py
+│   ├── test_classifier.py
 │   └── test_graph.py
 │
 ├── app.py                # minimal placeholder entry point
@@ -128,8 +150,10 @@ python -m venv .venv
 .\.venv\Scripts\pip install -r requirements.txt
 ```
 
-Copy `.env.example` to `.env` if you plan to configure environment variables
-later (no key is required for Iteration 1 — no OpenAI calls are made):
+Copy `.env.example` to `.env` and set `OPENAI_API_KEY` to run the graph for
+real (i.e. invoke it without injecting a fake classifier). No key is required
+to run the test suite — tests always inject a fake `RequestClassifier` and
+make no network calls:
 
 ```powershell
 Copy-Item .env.example .env

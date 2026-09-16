@@ -7,7 +7,7 @@ interactive loop, and no OpenAI call here yet.
 
 def main() -> None:
     print("AI Customer Operations Agent (Mercora) - foundation initialized.")
-    print("Iteration 1: project scaffold, typed state, and minimal LangGraph workflow.")
+    print("Iteration 2: intake + structured OpenAI request classification.")
 
 
 if __name__ == "__main__":

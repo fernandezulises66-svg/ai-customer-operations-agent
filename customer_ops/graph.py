@@ -1,16 +1,18 @@
-"""Minimal LangGraph workflow for the Mercora Customer Operations Agent.
+"""LangGraph workflow for the Mercora Customer Operations Agent.
 
-Iteration 1 wires a single deterministic node (`intake`) that validates and
-normalizes the initial request. It performs no LLM calls, no classification,
-no data retrieval, and no business decisions - those arrive in later
-iterations.
+`intake` deterministically validates and normalizes the initial request.
+`classify_request` then makes one model-powered call, through the injectable
+`RequestClassifier` interface, to classify intent and urgency. No data
+retrieval, policy evaluation, or business actions happen yet - those arrive
+in later iterations.
 
-Graph shape: START -> intake -> END
+Graph shape: START -> intake -> classify_request -> END
 """
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
+from customer_ops.classifier import OpenAIRequestClassifier, RequestClassifier
 from customer_ops.state import AuditEvent, CustomerOpsState
 
 
@@ -55,13 +57,54 @@ def intake_node(state: CustomerOpsState) -> dict:
     }
 
 
-def build_customer_ops_graph() -> CompiledStateGraph:
-    """Build and compile the minimal Customer Operations graph.
+def make_classification_node(classifier: RequestClassifier):
+    """Build the `classify_request` node bound to the given classifier.
 
-    Current shape: START -> intake -> END.
+    Dependency injection keeps the node decoupled from the OpenAI SDK: it
+    only ever calls `classifier.classify(...)` through the
+    `RequestClassifier` interface.
     """
+
+    def classification_node(state: CustomerOpsState) -> dict:
+        customer_message = state["customer_message"]
+        decision = classifier.classify(customer_message)
+
+        audit_event: AuditEvent = {
+            "step": "classification",
+            "message": (
+                f"Request classified as {decision.intent} with "
+                f"{decision.urgency} urgency."
+            ),
+            "status": "ok",
+        }
+
+        return {
+            "intent": decision.intent,
+            "urgency": decision.urgency,
+            "workflow_status": "classified",
+            "audit_log": [*state.get("audit_log", []), audit_event],
+        }
+
+    return classification_node
+
+
+def build_customer_ops_graph(classifier: RequestClassifier | None = None) -> CompiledStateGraph:
+    """Build and compile the Customer Operations graph.
+
+    Current shape: START -> intake -> classify_request -> END.
+
+    Pass a fake `RequestClassifier` (e.g. in tests) to avoid any OpenAI
+    dependency. Omitting `classifier` uses `OpenAIRequestClassifier`, the
+    production default; building the graph does not itself make a network
+    call - only invoking it as far as `classify_request` does.
+    """
+    if classifier is None:
+        classifier = OpenAIRequestClassifier()
+
     graph = StateGraph(CustomerOpsState)
     graph.add_node("intake", intake_node)
+    graph.add_node("classify_request", make_classification_node(classifier))
     graph.add_edge(START, "intake")
-    graph.add_edge("intake", END)
+    graph.add_edge("intake", "classify_request")
+    graph.add_edge("classify_request", END)
     return graph.compile()

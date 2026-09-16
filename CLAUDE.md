@@ -34,6 +34,13 @@ Guidance for Claude Code (and any future contributor) working in this repository
 - Future high-impact actions require explicit human approval in the workflow.
 - No hidden reasoning / chain-of-thought in outputs or audit logs. The audit
   trail records observable events (what happened), not model reasoning.
+- Model decisions should use structured outputs (e.g. Pydantic schemas via
+  the OpenAI Responses API `text_format`), not free-form text parsing, where
+  practical.
+- A technical failure (API error, malformed/missing structured output) must
+  never silently become a business decision. Raise a domain-specific
+  exception instead of substituting a default value such as `intent =
+  "other"`.
 
 ## Language
 
