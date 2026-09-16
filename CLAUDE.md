@@ -115,6 +115,21 @@ Guidance for Claude Code (and any future contributor) working in this repository
   separate concerns; neither is durable across a process restart in this
   project, and that limitation should be stated accurately, not implied to
   be production-grade.
+- Response generation is communication, not business decision-making: the
+  model may phrase intent/policy/routing/order-selection/approval/execution
+  outcomes naturally, but it never decides any of them - those facts must
+  already exist as validated structured state before the model is involved.
+- A final customer-facing response may use only validated state facts (e.g.
+  a narrow `ResponseContext`), never the full graph state, never invented
+  details (dates, amounts, addresses, promises) absent from that context.
+- No response may claim an action executed/succeeded before its
+  `ActionResult` exists and reports success - and never before an
+  approval-required action's human decision is "approved".
+- A response-context contract should expose the minimum operational data
+  necessary (e.g. one already-selected order, not the full order list) so
+  unrelated data cannot leak in structurally, not just by convention.
+- Final response text must never be duplicated into audit logs; audit
+  events describe that a response was generated, not its content.
 
 ## Language
 

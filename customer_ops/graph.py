@@ -37,6 +37,15 @@ Because LangGraph re-executes an interrupted node from its beginning on
 resume, everything in `human_approval_node` before `interrupt()` is a pure
 read/validation with no mutation, network call, or audit-log append.
 
+Every terminal branch (clarification, information, blocked,
+execute_safe_action, execute_approved_action, approval_rejected) now flows
+into `final_response` before END: it builds a narrow, PII-free
+`ResponseContext` from already-validated state and calls the injectable
+`CustomerResponseGenerator` exactly once to phrase - never decide - the
+customer-facing outcome. The interrupted approval path still stops at
+`interrupt()` on the initial invocation; `final_response` is only reached
+after resume.
+
 Graph shape:
 START -> intake -> classify_request -> load_context -> resolve_order
       -> evaluate_policy -> (conditional) -> {clarification, information,
@@ -45,7 +54,7 @@ START -> intake -> classify_request -> load_context -> resolve_order
          prepare_approval -> prepare_approval_input -> human_approval
             -- interrupt() --> (resume) --> {execute_approved_action,
             approval_rejected},
-         blocked} -> END
+         blocked} -> final_response -> END
 """
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -66,6 +75,11 @@ from customer_ops.approval import ApprovalError, build_approval_request, parse_h
 from customer_ops.classifier import OpenAIRequestClassifier, RequestClassifier
 from customer_ops.order_resolution import OrderResolution, resolve_order
 from customer_ops.policies import PolicyAssessment, evaluate_policy
+from customer_ops.response_generator import (
+    CustomerResponseGenerator,
+    OpenAICustomerResponseGenerator,
+    build_response_context,
+)
 from customer_ops.routing import determine_case_route
 from customer_ops.state import AuditEvent, CustomerOpsState
 from tools.action_store import CustomerActionStore, InMemoryCustomerActionStore
@@ -677,34 +691,85 @@ def make_blocked_node():
     return blocked_node
 
 
+def make_final_response_node(generator: CustomerResponseGenerator):
+    """Build the `final_response` node, reached by every terminal branch.
+
+    Builds a narrow, PII-free `ResponseContext` from already-validated
+    state - never the full graph state, never the audit log, never a full
+    customer/order record, never checkpointer data - and calls
+    `generator.generate(...)` exactly once. Stores only the resulting
+    message text in `final_response`, never the full `CustomerResponse`
+    object. The response generator may phrase the outcome; it never decides
+    intent, policy, routing, order selection, approval, or execution
+    results - those already exist in state by the time this node runs.
+    """
+
+    def final_response_node(state: CustomerOpsState) -> dict:
+        selected_order_id = state.get("selected_order_id")
+        order = _find_order(state.get("order_context"), selected_order_id) if selected_order_id else None
+
+        response_context = build_response_context(
+            state["customer_message"],
+            intent=state.get("intent"),
+            route=state.get("route"),
+            workflow_status=state.get("workflow_status"),
+            selected_order_id=selected_order_id,
+            order=order,
+            policy_assessment=state.get("policy_assessment"),
+            proposed_action=state.get("proposed_action"),
+            action_input=state.get("action_input"),
+            human_decision=state.get("human_decision"),
+            action_result=state.get("action_result"),
+        )
+
+        response = generator.generate(response_context)
+
+        audit_event: AuditEvent = {
+            "step": "final_response",
+            "message": "Customer-facing response generated.",
+            "status": "ok",
+        }
+
+        return {
+            "final_response": response.message,
+            "workflow_status": "completed",
+            "audit_log": [*state.get("audit_log", []), audit_event],
+        }
+
+    return final_response_node
+
+
 def build_customer_ops_graph(
     classifier: RequestClassifier | None = None,
     store: CustomerOperationsStore | None = None,
     action_input_extractor: ActionInputExtractor | None = None,
     action_store: CustomerActionStore | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
+    response_generator: CustomerResponseGenerator | None = None,
 ) -> CompiledStateGraph:
     """Build and compile the Customer Operations graph.
 
     Current shape:
     START -> intake -> classify_request -> load_context -> resolve_order
           -> evaluate_policy -> (conditional) -> one of:
-             - clarification -> END
-             - information -> END
+             - clarification -> final_response -> END
+             - information -> final_response -> END
              - propose_action -> prepare_action_input -> (conditional) ->
-               execute_safe_action -> END, or clarification -> END
+               execute_safe_action -> final_response -> END, or
+               clarification -> final_response -> END
              - prepare_approval -> prepare_approval_input -> human_approval
                -- interrupt() -- (resume) --> Command(goto=...) -> one of:
-               - execute_approved_action -> END
-               - approval_rejected -> END
-             - blocked -> END
+               - execute_approved_action -> final_response -> END
+               - approval_rejected -> final_response -> END
+             - blocked -> final_response -> END
 
     Pass fakes for any of the dependencies (e.g. in tests) to avoid any
-    OpenAI dependency or real fixture files. Omitting `classifier` or
-    `action_input_extractor` uses the real OpenAI-backed implementation;
-    building the graph never itself makes a network call - only invoking it
-    as far as `classify_request` or `prepare_action_input` (for
-    `change_address`) reaches OpenAI.
+    OpenAI dependency or real fixture files. Omitting `classifier`,
+    `action_input_extractor`, or `response_generator` uses the real
+    OpenAI-backed implementation; building the graph never itself makes a
+    network call - only invoking it as far as `classify_request`,
+    `prepare_action_input` (for `change_address`), or `final_response`
+    reaches OpenAI.
 
     Store consistency: `store` (used for `load_context`) and `action_store`
     (used for `execute_safe_action`/`execute_approved_action`) should be the
@@ -733,6 +798,8 @@ def build_customer_ops_graph(
         classifier = OpenAIRequestClassifier()
     if action_input_extractor is None:
         action_input_extractor = OpenAIActionInputExtractor()
+    if response_generator is None:
+        response_generator = OpenAICustomerResponseGenerator()
     if checkpointer is None:
         checkpointer = InMemorySaver()
 
@@ -763,6 +830,7 @@ def build_customer_ops_graph(
     graph.add_node("execute_approved_action", make_approved_action_execution_node(action_store))
     graph.add_node("approval_rejected", make_approval_rejected_node())
     graph.add_node("blocked", make_blocked_node())
+    graph.add_node("final_response", make_final_response_node(response_generator))
 
     graph.add_edge(START, "intake")
     graph.add_edge("intake", "classify_request")
@@ -786,14 +854,15 @@ def build_customer_ops_graph(
         _route_after_action_input,
         {"ready": "execute_safe_action", "missing": "clarification"},
     )
-    graph.add_edge("execute_safe_action", END)
+    graph.add_edge("execute_safe_action", "final_response")
     graph.add_edge("prepare_approval", "prepare_approval_input")
     graph.add_edge("prepare_approval_input", "human_approval")
     # human_approval routes dynamically via Command(goto=...) after resume -
     # no static edge to declare here.
-    graph.add_edge("execute_approved_action", END)
-    graph.add_edge("approval_rejected", END)
-    graph.add_edge("clarification", END)
-    graph.add_edge("information", END)
-    graph.add_edge("blocked", END)
+    graph.add_edge("execute_approved_action", "final_response")
+    graph.add_edge("approval_rejected", "final_response")
+    graph.add_edge("clarification", "final_response")
+    graph.add_edge("information", "final_response")
+    graph.add_edge("blocked", "final_response")
+    graph.add_edge("final_response", END)
     return graph.compile(checkpointer=checkpointer)

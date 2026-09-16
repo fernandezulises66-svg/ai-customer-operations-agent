@@ -2,9 +2,10 @@
 
 **Status: intake + classification + context loading + deterministic order
 resolution, policy evaluation, conditional routing, structured action
-proposals, simulated safe-action execution, and human-in-the-loop approval
-with LangGraph checkpointing (Iteration 7).** This is a portfolio project
-and is not production software.
+proposals, simulated safe-action execution, human-in-the-loop approval with
+LangGraph checkpointing, and final customer-facing response generation
+(Iteration 8).** This is a portfolio project and is not production
+software.
 
 > Mercora is a fictional e-commerce company invented for this project. All
 > customers, orders, policies, payments, addresses, and tickets referenced
@@ -43,7 +44,12 @@ observability.
 - The **OpenAI SDK** is called directly inside specific graph nodes that need
   LLM reasoning, using the Responses API's Structured Outputs mechanism
   rather than free-form text parsing; LangGraph orchestrates, it does not
-  hide business logic.
+  hide business logic. The LLM's responsibilities are deliberately narrow:
+  classify intent/urgency, extract an explicit replacement address when
+  needed, and phrase the final customer response - it never decides policy,
+  routing, order selection, approval, or execution results; those are
+  computed deterministically first and only handed to the model as already-
+  validated facts to communicate.
 - **Tools** (`tools/`) are narrow, independently testable interfaces used by
   graph nodes - the read-only `CustomerOperationsStore` and the mutating
   `CustomerActionStore`, kept as separate interfaces even where one class
@@ -55,87 +61,76 @@ observability.
 - The workflow state is checkpoint-friendly and produces a **structured audit
   trail** of observable events (not model reasoning).
 
-## Current implementation (Iteration 7: Human-in-the-Loop Approval and Checkpointing)
+## Current implementation (Iteration 8: Customer Response Generation)
 
-The full pipeline from a customer message to a simulated operational change
-now exists, including a genuine pause-for-human-approval step:
+Every completed (or paused) case now ends with a safe, customer-facing
+response, grounded only in validated workflow state - completing the full
+pipeline:
 
 **Policy** (what is allowed) **-> Routing** (which workflow path follows)
 **-> Proposed Action** (what operation is intended) **-> Action Input**
 (what validated parameters it needs) **-> `interrupt()`** (sensitive actions
 only - pause and wait for a human) **-> Executor** (calls exactly one store
-method, only after approval) **-> Simulated Store** (the in-memory mutation).
+method, only after approval) **-> Simulated Store** (the in-memory mutation)
+**-> Final Response** (phrase the outcome - never decide it).
 
-- **LLM**: intent + urgency interpretation, and - only for `change_address`
-  - structured address extraction (`customer_ops/classifier.py`,
-  `customer_ops/action_inputs.py`).
-- **Deterministic data store**: customer/order facts (`tools/customer_data.py`).
-- **Deterministic resolver / policy engine / router**: order selection,
-  eligibility, and branch selection (`customer_ops/order_resolution.py`,
-  `customer_ops/policies.py`, `customer_ops/routing.py`).
-- **Structured action proposals and inputs**: what a future action would do
-  and what validated parameters it needs, never invented
-  (`customer_ops/action_proposal.py`, `customer_ops/action_inputs.py`).
-- **Human-in-the-loop approval**: a real LangGraph `interrupt()` that pauses
-  the graph and exposes a minimal, PII-free `ApprovalRequest`; the human
-  decision comes only from external `Command(resume=...)` input - never
-  from the LLM, policy, intent, or urgency (`customer_ops/approval.py`).
-- **Simulated execution**: exactly one mutation call against an in-memory
-  operational store - for safe actions immediately, for sensitive actions
-  only after an explicit "approved" decision
-  (`customer_ops/action_executor.py`, `tools/action_store.py`).
+This separation is the project's core architecture point:
+
+- **LLM responsibilities**: classify intent/urgency; extract an explicit
+  replacement address only when `change_address` needs one; phrase the
+  final customer-facing response (`customer_ops/classifier.py`,
+  `customer_ops/action_inputs.py`, `customer_ops/response_generator.py`).
+- **Deterministic responsibilities**: customer/order facts, order
+  resolution, policy, routing, action-proposal mapping, action execution,
+  and approval enforcement (everything else in `customer_ops/`). The model
+  never decides any of these - they already exist as structured state by
+  the time the response generator runs.
 
 Implemented now:
 
-- **`customer_ops/approval.py`**: `ApprovalRequest` (`request_id`,
-  `action_type`, `order_id`, `message`, optional `amount`/`currency` for
-  `issue_refund` derived from the validated order) and
-  `HumanApprovalResponse` (`decision: "approved" | "rejected"`, using the
-  existing `HumanDecision` vocabulary). Never includes customer email,
-  shipping address, or a full customer/order record. A malformed resume
-  payload raises `ApprovalError` - it is never silently interpreted.
-- **`human_approval` node**: reads the already-prepared `ProposedAction` and
-  `ActionInputResult`, builds the `ApprovalRequest`, then calls
-  `interrupt(approval_request.model_dump(mode="json"))`. Because LangGraph
-  re-executes an interrupted node from its beginning on every resume,
-  everything before `interrupt()` here is a pure read/validation - no
-  mutation, no network call, no audit-log append happens until after the
-  human's decision comes back. On resume, it validates the decision and
-  returns `Command(update=..., goto="execute_approved_action" |
-  "approval_rejected")` - LangGraph-native resume routing.
-- **`execute_approved_action` node**: only reached after an "approved"
-  decision. Re-validates that the action genuinely required approval and
-  that its input is ready, then calls the *same* `execute_action` used for
-  safe actions, explicitly passing `human_approved=True` - the executor's
-  own defense-in-depth check from Iteration 6 still applies and is never
-  bypassed. Synchronizes `order_context` exactly like safe execution does.
-- **`approval_rejected` node**: performs zero mutation; `action_result`
-  stays absent; no automatic escalation.
-- **Checkpointing**: `build_customer_ops_graph(..., checkpointer=None)`
-  defaults to a fresh, process-local `InMemorySaver()` (never a module-level
-  global). Once compiled, *every* invocation - interrupted or not - requires
-  `config={"configurable": {"thread_id": ...}}`; the graph never generates
-  or derives a thread_id, the caller owns thread identity.
-- **Resume safety, proven by tests**: no store mutation happens before
-  `interrupt()` or on node replay; an approved resume causes exactly one
-  store mutation; resuming with an unrelated/unknown thread_id does not
-  resume the pending approval (the fresh run hits `intake`'s own explicit
-  validation instead); a malformed resume decision raises `ApprovalError`
-  without mutating anything.
+- **`customer_ops/response_generator.py`**: `CustomerResponse` (`message`
+  only - no reasoning, rationale, confidence, or citations) and
+  `ResponseContext`, a narrow, JSON-friendly, PII-free subset of state
+  (`customer_message`, `intent`, `route`, `workflow_status`,
+  `selected_order_id`, `order_summary` - order ID/status/tracking number
+  only, `policy_outcome`/`policy_code`/`policy_reason`, `proposed_action`,
+  `action_input`, `human_decision`, `action_result`). Never the full
+  `customer_context`/`order_context`, never `audit_log`, never checkpointer
+  data. `build_response_context(...)` takes only already-extracted
+  primitives (e.g. a single already-selected order, never the full order
+  list), so unrelated data structurally cannot leak in.
+- **`OpenAICustomerResponseGenerator`**: one OpenAI Responses API
+  Structured Outputs call per response, mirroring
+  `OpenAIRequestClassifier`/`OpenAIActionInputExtractor`. Instructed to use
+  ONLY the supplied context - never invent dates, amounts, addresses,
+  shipping estimates, compensation, policies, or support promises; never
+  claim an action succeeded unless `action_result.success` is true; never
+  claim a sensitive action happened unless `human_decision == "approved"`;
+  never mention LangGraph/OpenAI/internal architecture or expose raw
+  policy codes.
+- **Language**: Spanish-first; replies in English only when the customer's
+  own message is clearly English. Order IDs and action names are never
+  translated. No language selector.
+- **`final_response` node**: reached by every terminal branch
+  (clarification, information, blocked, safe execution, approved execution,
+  rejected). Builds the `ResponseContext`, calls
+  `generator.generate(...)` exactly once, stores only the resulting message
+  text in `final_response` (never the full `CustomerResponse` object), sets
+  `workflow_status = "completed"`, and appends one generic audit event -
+  the response text itself is never duplicated into `audit_log`.
+- **HITL ordering preserved**: an approval-required case still pauses at
+  `interrupt()` before ever reaching `final_response` - proven by tests
+  showing the response generator is called zero times on the interrupted
+  pass and exactly once total after resume, never twice.
 - LangGraph workflow:
-  `START -> intake -> classify_request -> load_context -> resolve_order -> evaluate_policy -> (conditional) -> {clarification, information, propose_action -> prepare_action_input -> (conditional) -> {execute_safe_action, clarification}, prepare_approval -> prepare_approval_input -> human_approval -- interrupt() -- (resume) --> {execute_approved_action, approval_rejected}, blocked} -> END`,
-  built via `build_customer_ops_graph(classifier=None, store=None, action_input_extractor=None, action_store=None, checkpointer=None)`.
-- Observable audit events for every stage, including `human_approval` (e.g.
-  "Human reviewer approved the proposed simulated action.") and
-  `approval_rejected` - never reviewer identity, timestamps, or hidden
-  reasoning.
-- A minimal `app.py` placeholder entry point (no CLI, no OpenAI call, no
-  interactive approval CLI yet).
+  `START -> intake -> classify_request -> load_context -> resolve_order -> evaluate_policy -> (conditional) -> {clarification, information, propose_action -> prepare_action_input -> (conditional) -> {execute_safe_action, clarification}, prepare_approval -> prepare_approval_input -> human_approval -- interrupt() -- (resume) --> {execute_approved_action, approval_rejected}, blocked} -> final_response -> END`,
+  built via `build_customer_ops_graph(classifier=None, store=None, action_input_extractor=None, action_store=None, checkpointer=None, response_generator=None)`.
+- A minimal `app.py` placeholder entry point (no CLI, no OpenAI call).
 - Unit tests for state contracts, models, the data store, the classifier,
   order resolution, policy evaluation, routing, action proposal, action
-  inputs, the action store, the action executor, approval contracts, and
-  full graph branch/HITL coverage - all running with no network access and
-  no API key.
+  inputs, the action store, the action executor, approval contracts, the
+  response generator, and full graph branch/HITL/response coverage - all
+  running with no network access and no API key.
 
 **Important limitations, stated accurately**: `InMemorySaver` checkpoint
 state survives separate invoke/resume calls only while this Python process
@@ -148,7 +143,6 @@ business storage.
 
 Planned later (not implemented yet):
 
-- Final customer-facing response generation.
 - Evaluation harness (`evals/`).
 - Streamlit UI.
 - Deployment.
@@ -186,6 +180,7 @@ ai-customer-operations-agent/
 │   ├── action_inputs.py    # ActionInputResult, prepare_action_input(), address extraction
 │   ├── action_executor.py  # ActionResult, execute_action() - one simulated mutation call
 │   ├── approval.py         # ApprovalRequest, HumanApprovalResponse - HITL contracts
+│   ├── response_generator.py # CustomerResponse, ResponseContext, build_response_context()
 │   └── graph.py            # all graph nodes, build_customer_ops_graph()
 │
 ├── tools/
@@ -215,6 +210,7 @@ ai-customer-operations-agent/
 │   ├── test_action_store.py
 │   ├── test_action_executor.py
 │   ├── test_approval.py
+│   ├── test_response_generator.py
 │   └── test_graph.py
 │
 ├── app.py                # minimal placeholder entry point
@@ -237,8 +233,9 @@ python -m venv .venv
 Copy `.env.example` to `.env` and set `OPENAI_API_KEY` to run the graph for
 real (i.e. invoke it without injecting fakes). No key is required to run the
 test suite — tests always inject a fake `RequestClassifier`, a fake/in-memory
-`CustomerOperationsStore`, and a fake `ActionInputExtractor`, use a fresh
-`InMemorySaver` per test graph, and make no network calls:
+`CustomerOperationsStore`, a fake `ActionInputExtractor`, and a fake
+`CustomerResponseGenerator`, use a fresh `InMemorySaver` per test graph, and
+make no network calls:
 
 ```powershell
 Copy-Item .env.example .env

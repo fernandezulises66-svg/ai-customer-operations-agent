@@ -3,15 +3,21 @@
 These tests cover our own behavior (validation, normalization, classification
 wiring, context loading, order resolution, policy evaluation, conditional
 routing, action proposal, action-input preparation, simulated execution,
-human-in-the-loop approval/checkpointing, audit logging, workflow status) -
-not LangGraph internals. No test makes a network or OpenAI API call:
-`classify_request` is always exercised through `FakeRequestClassifier`,
-`load_context` through `FakeCustomerOperationsStore` (or
-`InMemoryCustomerActionStore` for tests that also need mutation), and
-`change_address` input extraction through `FakeActionInputExtractor` - all
-deterministic test doubles defined below. `resolve_order`, `evaluate_policy`,
-routing, action proposal, and action execution are already fully
-deterministic and offline, so the real implementations are used directly.
+human-in-the-loop approval/checkpointing, final response generation, audit
+logging, workflow status) - not LangGraph internals. No test makes a network
+or OpenAI API call: `classify_request` is always exercised through
+`FakeRequestClassifier`, `load_context` through `FakeCustomerOperationsStore`
+(or `InMemoryCustomerActionStore` for tests that also need mutation),
+`change_address` input extraction through `FakeActionInputExtractor`, and
+final response generation through `FakeResponseGenerator` - all deterministic
+test doubles defined below. `resolve_order`, `evaluate_policy`, routing,
+action proposal, and action execution are already fully deterministic and
+offline, so the real implementations are used directly.
+
+Every completed workflow now flows through a `final_response` node before
+END, so `workflow_status` is `"completed"` and `final_response` is present
+for every terminal result - EXCEPT an interrupted approval-required case,
+which still pauses at `interrupt()` before ever reaching `final_response`.
 
 Every compiled graph now carries a checkpointer, so every `.invoke(...)`
 call requires `config={"configurable": {"thread_id": ...}}`. Most tests
@@ -33,6 +39,7 @@ from customer_ops.approval import ApprovalError
 from customer_ops.classifier import ClassificationDecision, ClassificationError
 from customer_ops.graph import InvalidCustomerRequest, build_customer_ops_graph
 from customer_ops.models import CustomerRecord, OrderRecord
+from customer_ops.response_generator import CustomerResponse, ResponseContext
 from tools.action_store import InMemoryCustomerActionStore
 from tools.customer_data import (
     DEFAULT_CUSTOMERS_PATH,
@@ -116,6 +123,27 @@ class FakeActionInputExtractor:
     def extract_new_shipping_address(self, customer_message: str) -> AddressExtraction:
         self.calls.append(customer_message)
         return AddressExtraction(new_shipping_address=self.address)
+
+
+class FakeResponseGenerator:
+    """Deterministic `CustomerResponseGenerator` test double.
+
+    Records every `ResponseContext` it receives and returns a configurable
+    `CustomerResponse` (or raises `exc` if set), so tests can assert the
+    node called it exactly once, never before an interrupt, and never twice
+    on resume.
+    """
+
+    def __init__(self, message: str = "FAKE_RESPONSE", exc: Exception | None = None):
+        self.message = message
+        self.exc = exc
+        self.calls: list[ResponseContext] = []
+
+    def generate(self, response_context: ResponseContext) -> CustomerResponse:
+        self.calls.append(response_context)
+        if self.exc is not None:
+            raise self.exc
+        return CustomerResponse(message=self.message)
 
 
 def make_customer(customer_id="cust-001", **overrides) -> CustomerRecord:
@@ -209,13 +237,21 @@ class MutationCountingActionStore(InMemoryCustomerActionStore):
         return super().create_product_investigation(order_id)
 
 
-def make_graph(classifier=None, store=None, action_input_extractor=None, action_store=None, checkpointer=None):
+def make_graph(
+    classifier=None,
+    store=None,
+    action_input_extractor=None,
+    action_store=None,
+    checkpointer=None,
+    response_generator=None,
+):
     return build_customer_ops_graph(
         classifier or FakeRequestClassifier(),
         store or default_store(),
         action_input_extractor or FakeActionInputExtractor(),
         action_store,
         checkpointer,
+        response_generator or FakeResponseGenerator(),
     )
 
 
@@ -238,7 +274,7 @@ def test_graph_builds_with_injected_classifier_and_store():
     assert graph is not None
 
 
-def test_valid_request_reaches_information_ready_status():
+def test_valid_request_reaches_completed_status():
     graph = make_graph()
     result = invoke(graph,
         {
@@ -247,8 +283,9 @@ def test_valid_request_reaches_information_ready_status():
             "customer_message": "Quiero saber el estado de order-0001.",
         }
     )
-    assert result["workflow_status"] == "information_ready"
+    assert result["workflow_status"] == "completed"
     assert result["route"] == "information"
+    assert result["final_response"] == "FAKE_RESPONSE"
 
 
 def test_customer_message_is_trimmed():
@@ -289,7 +326,7 @@ def test_request_id_and_customer_id_are_preserved():
     assert result["customer_id"] == "cust-042"
 
 
-def test_no_action_or_response_state_is_fabricated():
+def test_no_action_execution_state_is_fabricated():
     graph = make_graph()
     result = invoke(graph,
         {
@@ -298,11 +335,15 @@ def test_no_action_or_response_state_is_fabricated():
             "customer_message": "Where is my order?",
         }
     )
+    # A clarification case: no proposed action, no human decision, no
+    # execution, no escalation - but final_response IS now expected, since
+    # every terminal branch (including clarification) reaches it.
     assert "proposed_action" not in result
     assert "human_decision" not in result
     assert "action_result" not in result
-    assert "final_response" not in result
     assert "escalation_reason" not in result
+    assert result["final_response"] == "FAKE_RESPONSE"
+    assert result["workflow_status"] == "completed"
 
 
 def test_empty_message_is_rejected():
@@ -373,7 +414,7 @@ def test_graph_invocation_makes_no_network_calls(no_network):
             "customer_message": "What is the status of order-0001?",
         }
     )
-    assert result["workflow_status"] == "information_ready"
+    assert result["workflow_status"] == "completed"
 
 
 def test_state_contains_only_json_friendly_data():
@@ -606,7 +647,7 @@ def test_customer_with_zero_orders_is_valid():
             "customer_message": "Where is my order?",
         }
     )
-    assert result["workflow_status"] == "clarification_required"
+    assert result["workflow_status"] == "completed"
     assert result["route"] == "clarification"
     assert result["order_context"] == {"orders": [], "count": 0}
     assert result["order_resolution"]["status"] == "needs_clarification"
@@ -715,7 +756,7 @@ def test_policy_evaluation_audit_event_appended():
     assert "information_only" in result["audit_log"][4]["message"]
 
 
-def test_exactly_six_workflow_audit_stages():
+def test_exactly_seven_workflow_audit_stages():
     store = FakeCustomerOperationsStore(
         customers={"cust-777": make_customer("cust-777")},
         orders_by_customer={"cust-777": [make_order("order-aaa", "cust-777", status="shipped")]},
@@ -736,6 +777,7 @@ def test_exactly_six_workflow_audit_stages():
         "order_resolution",
         "policy_evaluation",
         "information",
+        "final_response",
     ]
 
 
@@ -779,8 +821,10 @@ def test_clarification_branch_for_ambiguous_order_reference():
     )
     assert result["route"] == "clarification"
     assert "proposed_action" not in result
-    assert result["workflow_status"] == "clarification_required"
-    assert result["audit_log"][-1]["step"] == "clarification"
+    assert result["workflow_status"] == "completed"
+    assert result["audit_log"][-2]["step"] == "clarification"
+    assert result["audit_log"][-1]["step"] == "final_response"
+    assert result["final_response"] == "FAKE_RESPONSE"
 
 
 def test_information_branch_for_order_status_with_explicit_order():
@@ -799,8 +843,10 @@ def test_information_branch_for_order_status_with_explicit_order():
     )
     assert result["route"] == "information"
     assert "proposed_action" not in result
-    assert result["workflow_status"] == "information_ready"
-    assert result["audit_log"][-1]["step"] == "information"
+    assert result["workflow_status"] == "completed"
+    assert result["audit_log"][-2]["step"] == "information"
+    assert result["audit_log"][-1]["step"] == "final_response"
+    assert result["final_response"] == "FAKE_RESPONSE"
 
 
 def test_safe_cancellation_executes_and_updates_order_state():
@@ -833,7 +879,7 @@ def test_safe_cancellation_executes_and_updates_order_state():
     assert result["action_result"]["success"] is True
     assert result["action_result"]["action_type"] == "cancel_order"
     assert result["action_result"]["order_id"] == "order-aaa"
-    assert result["workflow_status"] == "action_executed"
+    assert result["workflow_status"] == "completed"
     # State was synchronized: the order in context now shows the new status,
     # and it is the only order that changed.
     assert result["order_context"]["count"] == 1
@@ -847,10 +893,14 @@ def test_safe_cancellation_executes_and_updates_order_state():
         "action_proposal",
         "action_input",
         "action_execution",
+        "final_response",
     ]
     # Safe actions complete in a single invoke - no pause, no human decision.
     assert "__interrupt__" not in result
     assert "human_decision" not in result
+    # action_result is retained after final_response, and the response is
+    # generated after (and grounded in) execution.
+    assert result["final_response"] == "FAKE_RESPONSE"
 
 
 def test_address_change_with_explicit_address_executes():
@@ -873,9 +923,10 @@ def test_address_change_with_explicit_address_executes():
     assert result["route"] == "action"
     assert result["action_result"]["success"] is True
     assert result["action_result"]["action_type"] == "change_address"
-    assert result["workflow_status"] == "action_executed"
+    assert result["workflow_status"] == "completed"
     assert result["order_context"]["orders"][0]["shipping_address"] == new_address
     assert extractor.calls == [f"Please change the address on order-aaa to {new_address}."]
+    assert result["final_response"] == "FAKE_RESPONSE"
     # Safe actions complete in a single invoke - no pause, no human decision.
     assert "__interrupt__" not in result
     assert "human_decision" not in result
@@ -898,7 +949,7 @@ def test_address_change_without_new_address_requires_clarification():
         }
     )
     assert result["route"] == "clarification"
-    assert result["workflow_status"] == "clarification_required"
+    assert result["workflow_status"] == "completed"
     assert "action_result" not in result
     assert result["action_input"]["ready"] is False
     assert result["action_input"]["missing_fields"] == ["new_shipping_address"]
@@ -906,6 +957,7 @@ def test_address_change_without_new_address_requires_clarification():
     assert result["order_context"]["orders"][0]["shipping_address"] == "Old address"
     # The proposal is preserved for traceability even though it did not execute.
     assert result["proposed_action"]["action_type"] == "change_address"
+    assert result["final_response"] == "FAKE_RESPONSE"
 
 
 def test_approval_branch_for_refund_on_delivered_paid_order():
@@ -915,7 +967,8 @@ def test_approval_branch_for_refund_on_delivered_paid_order():
         orders_by_customer={"cust-777": [order]},
     )
     classifier = FakeRequestClassifier(intent="refund_request", urgency="high")
-    graph = make_graph(classifier, store)
+    generator = FakeResponseGenerator()
+    graph = make_graph(classifier, store, response_generator=generator)
     result = invoke(graph,
         {
             "request_id": "req-001",
@@ -941,6 +994,10 @@ def test_approval_branch_for_refund_on_delivered_paid_order():
     assert "action_result" not in result
     # No execution occurred - payment_status remains exactly as it was.
     assert result["order_context"]["orders"][0]["payment_status"] == "paid"
+    # The approval-required case pauses BEFORE reaching final_response.
+    assert "__interrupt__" in result
+    assert "final_response" not in result
+    assert generator.calls == []
 
 
 def test_billing_issue_approval_branch_does_not_execute():
@@ -950,7 +1007,8 @@ def test_billing_issue_approval_branch_does_not_execute():
         orders_by_customer={"cust-777": [order]},
     )
     classifier = FakeRequestClassifier(intent="billing_issue", urgency="high")
-    graph = make_graph(classifier, store)
+    generator = FakeResponseGenerator()
+    graph = make_graph(classifier, store, response_generator=generator)
     result = invoke(graph,
         {
             "request_id": "req-001",
@@ -963,6 +1021,8 @@ def test_billing_issue_approval_branch_does_not_execute():
     assert result["action_input"]["action_type"] == "investigate_billing"
     assert "action_result" not in result
     assert "human_decision" not in result
+    assert "final_response" not in result
+    assert generator.calls == []
 
 
 def test_product_issue_approval_branch_does_not_execute():
@@ -972,7 +1032,8 @@ def test_product_issue_approval_branch_does_not_execute():
         orders_by_customer={"cust-777": [order]},
     )
     classifier = FakeRequestClassifier(intent="product_issue", urgency="medium")
-    graph = make_graph(classifier, store)
+    generator = FakeResponseGenerator()
+    graph = make_graph(classifier, store, response_generator=generator)
     result = invoke(graph,
         {
             "request_id": "req-001",
@@ -985,6 +1046,8 @@ def test_product_issue_approval_branch_does_not_execute():
     assert result["action_input"]["action_type"] == "investigate_product_issue"
     assert "action_result" not in result
     assert "human_decision" not in result
+    assert "final_response" not in result
+    assert generator.calls == []
 
 
 def test_audit_log_does_not_contain_new_shipping_address():
@@ -1023,7 +1086,7 @@ def test_action_execution_makes_no_network_calls(no_network):
             "customer_message": "Please cancel order-aaa.",
         }
     )
-    assert result["workflow_status"] == "action_executed"
+    assert result["workflow_status"] == "completed"
 
 
 def test_graph_execution_does_not_modify_real_fixture_files():
@@ -1068,8 +1131,10 @@ def test_blocked_branch_for_address_change_on_shipped_order():
     )
     assert result["route"] == "blocked"
     assert "proposed_action" not in result
-    assert result["workflow_status"] == "blocked"
-    assert result["audit_log"][-1]["step"] == "blocked"
+    assert result["workflow_status"] == "completed"
+    assert result["audit_log"][-2]["step"] == "blocked"
+    assert result["audit_log"][-1]["step"] == "final_response"
+    assert result["final_response"] == "FAKE_RESPONSE"
 
 
 def test_information_branch_for_other_intent():
@@ -1085,8 +1150,10 @@ def test_information_branch_for_other_intent():
     )
     assert result["route"] == "information"
     assert "proposed_action" not in result
-    assert result["workflow_status"] == "information_ready"
-    assert result["audit_log"][-1]["step"] == "information"
+    assert result["workflow_status"] == "completed"
+    assert result["audit_log"][-2]["step"] == "information"
+    assert result["audit_log"][-1]["step"] == "final_response"
+    assert result["final_response"] == "FAKE_RESPONSE"
 
 
 @pytest.mark.parametrize(
@@ -1167,7 +1234,8 @@ def test_refund_approved_executes_and_mutates_exactly_once():
     order = make_order("order-aaa", "cust-777", status="delivered", payment_status="paid", total=79.0)
     store = MutationCountingActionStore(customers=[make_customer("cust-777")], orders=[order])
     classifier = FakeRequestClassifier(intent="refund_request", urgency="high")
-    graph = make_graph(classifier, store, action_store=store)
+    generator = FakeResponseGenerator()
+    graph = make_graph(classifier, store, action_store=store, response_generator=generator)
     config = thread_config("refund-approved")
 
     graph.invoke(
@@ -1178,15 +1246,20 @@ def test_refund_approved_executes_and_mutates_exactly_once():
         },
         config=config,
     )
+    assert generator.calls == []  # not called before approval
     result = graph.invoke(Command(resume={"decision": "approved"}), config=config)
 
     assert result["human_decision"] == "approved"
     assert result["order_context"]["orders"][0]["payment_status"] == "refunded"
     assert result["action_result"]["success"] is True
     assert result["action_result"]["action_type"] == "issue_refund"
-    assert result["workflow_status"] == "action_executed"
-    assert result["audit_log"][-1]["step"] == "action_execution"
+    assert result["workflow_status"] == "completed"
+    assert result["final_response"] == "FAKE_RESPONSE"
+    assert result["audit_log"][-2]["step"] == "action_execution"
+    assert result["audit_log"][-1]["step"] == "final_response"
     assert store.mutation_calls == [("issue_full_refund", "order-aaa")]
+    # Exactly one response generated - never on the interrupted pass, never twice.
+    assert len(generator.calls) == 1
 
 
 def test_refund_rejected_performs_no_mutation():
@@ -1194,7 +1267,8 @@ def test_refund_rejected_performs_no_mutation():
     order = make_order("order-aaa", "cust-777", status="delivered", payment_status="paid", total=79.0)
     store = MutationCountingActionStore(customers=[make_customer("cust-777")], orders=[order])
     classifier = FakeRequestClassifier(intent="refund_request", urgency="high")
-    graph = make_graph(classifier, store, action_store=store)
+    generator = FakeResponseGenerator()
+    graph = make_graph(classifier, store, action_store=store, response_generator=generator)
     config = thread_config("refund-rejected")
 
     graph.invoke(
@@ -1209,9 +1283,12 @@ def test_refund_rejected_performs_no_mutation():
 
     assert result["human_decision"] == "rejected"
     assert "action_result" not in result
-    assert result["workflow_status"] == "approval_rejected"
-    assert result["audit_log"][-1]["step"] == "approval_rejected"
+    assert result["workflow_status"] == "completed"
+    assert result["final_response"] == "FAKE_RESPONSE"
+    assert result["audit_log"][-2]["step"] == "approval_rejected"
+    assert result["audit_log"][-1]["step"] == "final_response"
     assert result["order_context"]["orders"][0]["payment_status"] == "paid"
+    assert len(generator.calls) == 1
     assert store.mutation_calls == []
 
 
@@ -1220,7 +1297,8 @@ def test_billing_investigation_approved_creates_investigation_once():
     order = make_order("order-aaa", "cust-777", status="delivered")
     store = MutationCountingActionStore(customers=[make_customer("cust-777")], orders=[order])
     classifier = FakeRequestClassifier(intent="billing_issue", urgency="high")
-    graph = make_graph(classifier, store, action_store=store)
+    generator = FakeResponseGenerator()
+    graph = make_graph(classifier, store, action_store=store, response_generator=generator)
     config = thread_config("billing-approved")
 
     initial = graph.invoke(
@@ -1233,14 +1311,17 @@ def test_billing_investigation_approved_creates_investigation_once():
     )
     assert "__interrupt__" in initial
     assert store.mutation_calls == []  # nothing happens before resume
+    assert generator.calls == []
 
     result = graph.invoke(Command(resume={"decision": "approved"}), config=config)
 
     assert result["action_result"]["success"] is True
     assert result["action_result"]["action_type"] == "investigate_billing"
     assert result["action_result"]["reference_id"] == "billing-investigation-order-aaa"
-    assert result["workflow_status"] == "action_executed"
+    assert result["workflow_status"] == "completed"
+    assert result["final_response"] == "FAKE_RESPONSE"
     assert store.mutation_calls == [("create_billing_investigation", "order-aaa")]
+    assert len(generator.calls) == 1
 
 
 def test_billing_investigation_rejected_creates_no_investigation():
@@ -1262,7 +1343,8 @@ def test_billing_investigation_rejected_creates_no_investigation():
     result = graph.invoke(Command(resume={"decision": "rejected"}), config=config)
 
     assert "action_result" not in result
-    assert result["workflow_status"] == "approval_rejected"
+    assert result["workflow_status"] == "completed"
+    assert result["final_response"] == "FAKE_RESPONSE"
     assert store.mutation_calls == []
 
 
@@ -1290,6 +1372,8 @@ def test_product_investigation_approved_executes_only_after_resume():
     assert result["action_result"]["success"] is True
     assert result["action_result"]["action_type"] == "investigate_product_issue"
     assert result["action_result"]["reference_id"] == "product-investigation-order-aaa"
+    assert result["workflow_status"] == "completed"
+    assert result["final_response"] == "FAKE_RESPONSE"
     assert store.mutation_calls == [("create_product_investigation", "order-aaa")]
 
 
@@ -1312,7 +1396,8 @@ def test_product_investigation_rejected_performs_no_mutation():
     result = graph.invoke(Command(resume={"decision": "rejected"}), config=config)
 
     assert "action_result" not in result
-    assert result["workflow_status"] == "approval_rejected"
+    assert result["workflow_status"] == "completed"
+    assert result["final_response"] == "FAKE_RESPONSE"
     assert store.mutation_calls == []
 
 
@@ -1479,4 +1564,59 @@ def test_hitl_flow_makes_no_network_calls(no_network):
         config=config,
     )
     result = graph.invoke(Command(resume={"decision": "approved"}), config=config)
-    assert result["workflow_status"] == "action_executed"
+    assert result["workflow_status"] == "completed"
+    assert result["final_response"] == "FAKE_RESPONSE"
+
+
+def test_audit_log_does_not_contain_the_final_response_text():
+    distinctive_message = "This exact sentence must never appear in audit_log."
+    store = make_action_store(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={"cust-777": [make_order("order-aaa", "cust-777", status="shipped")]},
+    )
+    classifier = FakeRequestClassifier(intent="order_status", urgency="low")
+    generator = FakeResponseGenerator(message=distinctive_message)
+    graph = make_graph(classifier, store, action_store=store, response_generator=generator)
+    result = invoke(
+        graph,
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "Where is order-aaa?",
+        },
+    )
+    assert result["final_response"] == distinctive_message
+    for event in result["audit_log"]:
+        assert distinctive_message not in event["message"]
+    # The final_response audit event itself is a fixed, generic marker.
+    assert result["audit_log"][-1] == {
+        "step": "final_response",
+        "message": "Customer-facing response generated.",
+        "status": "ok",
+    }
+
+
+@pytest.mark.parametrize(
+    "intent,order_status,message",
+    [
+        ("order_status", "shipped", "Where is order-aaa?"),
+        ("cancel_order", "shipped", "I want to cancel my order."),  # -> clarification
+        ("cancel_order", "pending", "Please cancel order-aaa."),  # -> safe action
+        ("address_change", "shipped", "Please change the address on order-aaa."),  # -> blocked
+    ],
+)
+def test_response_generator_called_exactly_once_per_completed_workflow(intent, order_status, message):
+    store = make_action_store(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={"cust-777": [make_order("order-aaa", "cust-777", status=order_status)]},
+    )
+    classifier = FakeRequestClassifier(intent=intent, urgency="medium")
+    generator = FakeResponseGenerator()
+    graph = make_graph(classifier, store, action_store=store, response_generator=generator)
+    result = invoke(
+        graph,
+        {"request_id": "req-001", "customer_id": "cust-777", "customer_message": message},
+    )
+    assert result["workflow_status"] == "completed"
+    assert result["final_response"] == "FAKE_RESPONSE"
+    assert len(generator.calls) == 1
