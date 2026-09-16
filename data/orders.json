@@ -1,0 +1,188 @@
+[
+  {
+    "order_id": "order-1001",
+    "customer_id": "cust-001",
+    "status": "shipped",
+    "payment_status": "paid",
+    "total": 89.99,
+    "currency": "USD",
+    "shipping_address": "482 Maple Street, Springfield, IL 62704, USA",
+    "tracking_number": "1Z999AA10123456784",
+    "items": [
+      {
+        "sku": "MER-WBT-001",
+        "name": "Wireless Bluetooth Headphones",
+        "quantity": 1,
+        "unit_price": 89.99
+      }
+    ]
+  },
+  {
+    "order_id": "order-1002",
+    "customer_id": "cust-001",
+    "status": "delivered",
+    "payment_status": "paid",
+    "total": 79.00,
+    "currency": "USD",
+    "shipping_address": "482 Maple Street, Springfield, IL 62704, USA",
+    "tracking_number": "1Z999AA10123456785",
+    "items": [
+      {
+        "sku": "MER-KTL-014",
+        "name": "Stainless Steel Kettle",
+        "quantity": 1,
+        "unit_price": 54.50
+      },
+      {
+        "sku": "MER-MUG-002",
+        "name": "Ceramic Travel Mug",
+        "quantity": 2,
+        "unit_price": 12.25
+      }
+    ]
+  },
+  {
+    "order_id": "order-1003",
+    "customer_id": "cust-001",
+    "status": "cancelled",
+    "payment_status": "refunded",
+    "total": 29.99,
+    "currency": "USD",
+    "shipping_address": "17 Birchwood Lane, Springfield, IL 62704, USA",
+    "tracking_number": null,
+    "items": [
+      {
+        "sku": "MER-BAG-007",
+        "name": "Canvas Tote Bag",
+        "quantity": 1,
+        "unit_price": 29.99
+      }
+    ]
+  },
+  {
+    "order_id": "order-1004",
+    "customer_id": "cust-002",
+    "status": "processing",
+    "payment_status": "paid",
+    "total": 34.99,
+    "currency": "USD",
+    "shipping_address": "9 Cedar Court, Riverdale, NY 10471, USA",
+    "tracking_number": null,
+    "items": [
+      {
+        "sku": "MER-LMP-003",
+        "name": "LED Desk Lamp",
+        "quantity": 1,
+        "unit_price": 34.99
+      }
+    ]
+  },
+  {
+    "order_id": "order-1005",
+    "customer_id": "cust-002",
+    "status": "pending",
+    "payment_status": "pending",
+    "total": 29.97,
+    "currency": "USD",
+    "shipping_address": "9 Cedar Court, Riverdale, NY 10471, USA",
+    "tracking_number": null,
+    "items": [
+      {
+        "sku": "MER-NBK-021",
+        "name": "Recycled Notebook Set",
+        "quantity": 3,
+        "unit_price": 9.99
+      }
+    ]
+  },
+  {
+    "order_id": "order-1006",
+    "customer_id": "cust-003",
+    "status": "delivered",
+    "payment_status": "paid",
+    "total": 249.00,
+    "currency": "USD",
+    "shipping_address": "205 Willow Avenue, Lakeview, TX 75001, USA",
+    "tracking_number": "1Z999AA10123456786",
+    "items": [
+      {
+        "sku": "MER-CHR-010",
+        "name": "Ergonomic Desk Chair",
+        "quantity": 1,
+        "unit_price": 249.00
+      }
+    ]
+  },
+  {
+    "order_id": "order-1007",
+    "customer_id": "cust-003",
+    "status": "cancelled",
+    "payment_status": "failed",
+    "total": 59.99,
+    "currency": "USD",
+    "shipping_address": "205 Willow Avenue, Lakeview, TX 75001, USA",
+    "tracking_number": null,
+    "items": [
+      {
+        "sku": "MER-SPK-005",
+        "name": "Portable Bluetooth Speaker",
+        "quantity": 1,
+        "unit_price": 59.99
+      }
+    ]
+  },
+  {
+    "order_id": "order-1008",
+    "customer_id": "cust-004",
+    "status": "pending",
+    "payment_status": "pending",
+    "total": 129.00,
+    "currency": "USD",
+    "shipping_address": "63 Aspen Ridge, Millbrook, OH 44601, USA",
+    "tracking_number": null,
+    "items": [
+      {
+        "sku": "MER-WCH-009",
+        "name": "Smart Fitness Watch",
+        "quantity": 1,
+        "unit_price": 129.00
+      }
+    ]
+  },
+  {
+    "order_id": "order-1009",
+    "customer_id": "cust-006",
+    "status": "shipped",
+    "payment_status": "paid",
+    "total": 39.98,
+    "currency": "USD",
+    "shipping_address": "1120 Sunset Boulevard, Harborview, CA 90210, USA",
+    "tracking_number": "1Z999AA10123456787",
+    "items": [
+      {
+        "sku": "MER-BLT-006",
+        "name": "Insulated Water Bottle",
+        "quantity": 2,
+        "unit_price": 19.99
+      }
+    ]
+  },
+  {
+    "order_id": "order-1010",
+    "customer_id": "cust-006",
+    "status": "processing",
+    "payment_status": "paid",
+    "total": 44.99,
+    "currency": "USD",
+    "shipping_address": "1120 Sunset Boulevard, Harborview, CA 90210, USA",
+    "tracking_number": null,
+    "items": [
+      {
+        "sku": "MER-PLW-012",
+        "name": "Memory Foam Pillow",
+        "quantity": 1,
+        "unit_price": 44.99
+      }
+    ]
+  }
+]

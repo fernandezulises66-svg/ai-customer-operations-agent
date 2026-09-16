@@ -1,13 +1,12 @@
 """Typed state contracts for the Mercora Customer Operations Agent workflow.
 
 This module defines the LangGraph state schema and the controlled vocabularies
-(Literal aliases) shared across workflow nodes. Iteration 1 only establishes
-these contracts - no classification, retrieval, policy, or action logic lives
-here yet.
+(Literal aliases) shared across workflow nodes.
 
 All state values must remain JSON/checkpoint friendly: strings, booleans,
 numbers, lists, dictionaries, or None. Never store live OpenAI clients, tool
-objects, graph instances, or other runtime services in state.
+objects, graph instances, data-store instances, or other runtime services in
+state.
 """
 
 from typing import Any, List, Literal, NotRequired, TypedDict, get_args
@@ -65,6 +64,20 @@ class AuditEvent(TypedDict):
     status: NotRequired[Literal["ok", "error"]]
 
 
+# --- Context state --------------------------------------------------------------
+
+
+class OrderContext(TypedDict):
+    """The envelope produced by context loading for a customer's orders.
+
+    `orders` holds JSON-friendly order records (e.g. `OrderRecord.model_dump
+    (mode="json")` from `customer_ops/models.py`), never Pydantic objects.
+    """
+
+    orders: List[dict[str, Any]]
+    count: int
+
+
 # --- Workflow state -----------------------------------------------------------
 
 
@@ -81,13 +94,13 @@ class CustomerOpsState(TypedDict):
     customer_id: str
     customer_message: str
 
-    # Classification (future iterations)
+    # Classification
     intent: NotRequired[Intent | None]
     urgency: NotRequired[Urgency | None]
 
-    # Retrieved context (future iterations)
+    # Retrieved context
     customer_context: NotRequired[dict[str, Any] | None]
-    order_context: NotRequired[dict[str, Any] | None]
+    order_context: NotRequired[OrderContext | None]
 
     # Policy and action planning (future iterations)
     policy_assessment: NotRequired[dict[str, Any] | None]

@@ -2,11 +2,13 @@
 
 `intake` deterministically validates and normalizes the initial request.
 `classify_request` then makes one model-powered call, through the injectable
-`RequestClassifier` interface, to classify intent and urgency. No data
-retrieval, policy evaluation, or business actions happen yet - those arrive
-in later iterations.
+`RequestClassifier` interface, to classify intent and urgency. `load_context`
+deterministically retrieves the customer and their orders through the
+injectable `CustomerOperationsStore` interface - the LLM never generates or
+infers customer/order facts. No policy evaluation or business actions happen
+yet - those arrive in later iterations.
 
-Graph shape: START -> intake -> classify_request -> END
+Graph shape: START -> intake -> classify_request -> load_context -> END
 """
 
 from langgraph.graph import END, START, StateGraph
@@ -14,6 +16,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from customer_ops.classifier import OpenAIRequestClassifier, RequestClassifier
 from customer_ops.state import AuditEvent, CustomerOpsState
+from tools.customer_data import CustomerOperationsStore, JsonCustomerOperationsStore
 
 
 class InvalidCustomerRequest(ValueError):
@@ -88,23 +91,70 @@ def make_classification_node(classifier: RequestClassifier):
     return classification_node
 
 
-def build_customer_ops_graph(classifier: RequestClassifier | None = None) -> CompiledStateGraph:
+def make_context_loader_node(store: CustomerOperationsStore):
+    """Build the `load_context` node bound to the given store.
+
+    Dependency injection keeps the node decoupled from the JSON fixture
+    files: it only ever calls `store.get_customer(...)` and
+    `store.list_orders_for_customer(...)` through the
+    `CustomerOperationsStore` interface. Records are serialized to plain
+    dict/list values before entering state - no Pydantic objects in
+    `CustomerOpsState`.
+    """
+
+    def context_loader_node(state: CustomerOpsState) -> dict:
+        customer_id = state["customer_id"]
+        customer = store.get_customer(customer_id)
+        orders = store.list_orders_for_customer(customer_id)
+
+        customer_context = customer.model_dump(mode="json")
+        order_context = {
+            "orders": [order.model_dump(mode="json") for order in orders],
+            "count": len(orders),
+        }
+
+        audit_event: AuditEvent = {
+            "step": "context_loading",
+            "message": f"Loaded customer context and {len(orders)} order records.",
+            "status": "ok",
+        }
+
+        return {
+            "customer_context": customer_context,
+            "order_context": order_context,
+            "workflow_status": "context_loaded",
+            "audit_log": [*state.get("audit_log", []), audit_event],
+        }
+
+    return context_loader_node
+
+
+def build_customer_ops_graph(
+    classifier: RequestClassifier | None = None,
+    store: CustomerOperationsStore | None = None,
+) -> CompiledStateGraph:
     """Build and compile the Customer Operations graph.
 
-    Current shape: START -> intake -> classify_request -> END.
+    Current shape: START -> intake -> classify_request -> load_context -> END.
 
-    Pass a fake `RequestClassifier` (e.g. in tests) to avoid any OpenAI
-    dependency. Omitting `classifier` uses `OpenAIRequestClassifier`, the
-    production default; building the graph does not itself make a network
-    call - only invoking it as far as `classify_request` does.
+    Pass a fake `RequestClassifier` and/or `CustomerOperationsStore` (e.g. in
+    tests) to avoid any OpenAI dependency or real fixture files. Omitting
+    either uses the production defaults (`OpenAIRequestClassifier`,
+    `JsonCustomerOperationsStore`); building the graph loads and validates
+    the local JSON fixtures but makes no network call - only invoking the
+    graph as far as `classify_request` reaches OpenAI.
     """
     if classifier is None:
         classifier = OpenAIRequestClassifier()
+    if store is None:
+        store = JsonCustomerOperationsStore()
 
     graph = StateGraph(CustomerOpsState)
     graph.add_node("intake", intake_node)
     graph.add_node("classify_request", make_classification_node(classifier))
+    graph.add_node("load_context", make_context_loader_node(store))
     graph.add_edge(START, "intake")
     graph.add_edge("intake", "classify_request")
-    graph.add_edge("classify_request", END)
+    graph.add_edge("classify_request", "load_context")
+    graph.add_edge("load_context", END)
     return graph.compile()

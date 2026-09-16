@@ -1,0 +1,44 @@
+[
+  {
+    "customer_id": "cust-001",
+    "name": "Mariana Torres",
+    "email": "mariana.torres@example.com",
+    "account_status": "active",
+    "customer_tier": "premium"
+  },
+  {
+    "customer_id": "cust-002",
+    "name": "Diego Fernandez",
+    "email": "diego.fernandez@example.com",
+    "account_status": "active",
+    "customer_tier": "standard"
+  },
+  {
+    "customer_id": "cust-003",
+    "name": "Lucia Gomez",
+    "email": "lucia.gomez@example.com",
+    "account_status": "active",
+    "customer_tier": "standard"
+  },
+  {
+    "customer_id": "cust-004",
+    "name": "Carlos Ruiz",
+    "email": "carlos.ruiz@example.com",
+    "account_status": "suspended",
+    "customer_tier": "standard"
+  },
+  {
+    "customer_id": "cust-005",
+    "name": "Ana Beltran",
+    "email": "ana.beltran@example.com",
+    "account_status": "active",
+    "customer_tier": "premium"
+  },
+  {
+    "customer_id": "cust-006",
+    "name": "Javier Morales",
+    "email": "javier.morales@example.com",
+    "account_status": "active",
+    "customer_tier": "standard"
+  }
+]

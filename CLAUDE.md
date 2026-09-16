@@ -24,6 +24,10 @@ Guidance for Claude Code (and any future contributor) working in this repository
 - Tools (in `tools/`) must be narrow and independently testable.
 - Sensitive/high-impact simulated actions require human approval before
   execution (human-in-the-loop gate in the graph).
+- `CustomerOpsState` values must remain serialization/checkpoint friendly
+  (str, int, float, bool, list, dict, or None). Never store Pydantic model
+  instances, live clients, or other runtime objects directly in state -
+  convert them (e.g. `model_dump(mode="json")`) before writing to state.
 
 ## Safety and behavior
 
@@ -33,7 +37,9 @@ Guidance for Claude Code (and any future contributor) working in this repository
 - Actions must be validated before execution.
 - Future high-impact actions require explicit human approval in the workflow.
 - No hidden reasoning / chain-of-thought in outputs or audit logs. The audit
-  trail records observable events (what happened), not model reasoning.
+  trail records observable events (what happened), not model reasoning, and
+  not full customer/order details (e.g. email, address, tracking number) -
+  keep audit messages generic and observable, never a data dump.
 - Model decisions should use structured outputs (e.g. Pydantic schemas via
   the OpenAI Responses API `text_format`), not free-form text parsing, where
   practical.
@@ -41,6 +47,13 @@ Guidance for Claude Code (and any future contributor) working in this repository
   never silently become a business decision. Raise a domain-specific
   exception instead of substituting a default value such as `intent =
   "other"`.
+- Operational facts (customer identity, order status, totals, addresses,
+  tracking numbers, purchased items, etc.) must come from deterministic
+  data/tools, never from model invention - even when the model is only
+  "filling in" a plausible-looking value.
+- Read-only and mutating operational tools must stay clearly separated
+  (e.g. `tools/customer_data.py` is read-only; simulated mutations belong in
+  their own future module and require human approval).
 
 ## Language
 
