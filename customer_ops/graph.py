@@ -20,28 +20,41 @@ by structured state, never an LLM call - routes to one of five branches:
   executes the simulated mutation (`execute_safe_action`) or - if required
   input is missing and was NOT invented - falls back to `clarification`.
 - `approval` (sensitive: issue_refund, investigate_billing,
-  investigate_product_issue) also prepares validated execution input for a
-  future human reviewer, but never executes in this iteration; it always
-  ends at `awaiting_approval`.
+  investigate_product_issue) also prepares validated execution input, then
+  reaches `human_approval` - a real LangGraph `interrupt()` that pauses the
+  graph and exposes a minimal, PII-free `ApprovalRequest` to an external
+  reviewer. Resuming with `Command(resume={"decision": ...})` on the SAME
+  thread_id routes to `execute_approved_action` (approved) or
+  `approval_rejected` (rejected) - execution only ever happens after an
+  explicit "approved" decision, never automatically.
 
 Mutations run only against the in-memory simulated `CustomerActionStore` -
 `data/*.json` fixtures are never written to, and a successful mutation is
 synchronized back into `order_context` so graph state never shows stale
 data.
 
+Because LangGraph re-executes an interrupted node from its beginning on
+resume, everything in `human_approval_node` before `interrupt()` is a pure
+read/validation with no mutation, network call, or audit-log append.
+
 Graph shape:
 START -> intake -> classify_request -> load_context -> resolve_order
       -> evaluate_policy -> (conditional) -> {clarification, information,
          propose_action -> prepare_action_input -> (conditional) ->
             {execute_safe_action, clarification},
-         prepare_approval -> prepare_approval_input,
+         prepare_approval -> prepare_approval_input -> human_approval
+            -- interrupt() --> (resume) --> {execute_approved_action,
+            approval_rejected},
          blocked} -> END
 """
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command, interrupt
 
-from customer_ops.action_executor import execute_action
+from customer_ops.action_executor import ActionExecutionError, execute_action
 from customer_ops.action_inputs import (
     ActionInputExtractor,
     ActionInputResult,
@@ -49,6 +62,7 @@ from customer_ops.action_inputs import (
     prepare_action_input,
 )
 from customer_ops.action_proposal import ActionProposalError, ProposedAction, propose_action
+from customer_ops.approval import ApprovalError, build_approval_request, parse_human_approval_response
 from customer_ops.classifier import OpenAIRequestClassifier, RequestClassifier
 from customer_ops.order_resolution import OrderResolution, resolve_order
 from customer_ops.policies import PolicyAssessment, evaluate_policy
@@ -354,8 +368,8 @@ def make_approval_preparation_node(proposer=propose_action):
     Only reached when policy outcome is `review_required` (e.g.
     refund_request, billing_issue, product_issue): proposes a structured
     `ProposedAction` with `requires_human_approval=True`. Feeds into
-    `prepare_approval_input` next. No interrupt, no human decision, and no
-    execution yet - those arrive in a later iteration.
+    `prepare_approval_input`, then `human_approval` - this node itself
+    performs no interrupt and no execution.
     """
 
     def approval_preparation_node(state: CustomerOpsState) -> dict:
@@ -422,7 +436,7 @@ def make_approval_action_input_node(extractor: ActionInputExtractor, preparer=pr
 
     Prepares the same validated execution input as `make_action_input_node`
     so a future human reviewer knows exactly what operation is waiting -
-    but always finalizes the case at `awaiting_approval`. None of the three
+    then always proceeds to `human_approval`. None of the three
     approval-required action types ever need the model extractor or can be
     "not ready", so no conditional branching is needed here.
     """
@@ -444,6 +458,142 @@ def make_approval_action_input_node(extractor: ActionInputExtractor, preparer=pr
         }
 
     return approval_action_input_node
+
+
+def _find_order(order_context, order_id: str) -> dict | None:
+    """Look up one order dict inside `order_context` by ID, or `None`."""
+    for order in (order_context or {}).get("orders", []):
+        if order.get("order_id") == order_id:
+            return order
+    return None
+
+
+def make_human_approval_node():
+    """Build the `human_approval` node: a real LangGraph `interrupt()`.
+
+    LangGraph re-executes an interrupted node from its beginning on every
+    resume, so everything before `interrupt()` here is a pure read and
+    validation - it builds the minimal `ApprovalRequest` but performs no
+    mutation, no network call, and no audit-log append. Only after
+    `interrupt()` returns the human's decision (on resume) does this node
+    validate it, append the one `human_approval` audit event, and return a
+    `Command` routing to `execute_approved_action` or `approval_rejected` -
+    LangGraph-native resume routing, not emulated outside the graph.
+    """
+
+    def human_approval_node(state: CustomerOpsState) -> Command:
+        proposed_action = ProposedAction.model_validate(state["proposed_action"])
+        action_input = ActionInputResult.model_validate(state["action_input"])
+
+        if not proposed_action.requires_human_approval:
+            raise ApprovalError(
+                f"Action {proposed_action.action_type!r} does not require human approval."
+            )
+        if not action_input.ready:
+            raise ApprovalError(
+                f"Cannot request approval for action {proposed_action.action_type!r}: "
+                f"input is not ready (missing_fields={action_input.missing_fields!r})."
+            )
+        if state.get("action_result") is not None:
+            raise ApprovalError("An action_result already exists; refusing to request approval again.")
+
+        order = _find_order(state.get("order_context"), proposed_action.order_id)
+        approval_request = build_approval_request(state["request_id"], proposed_action, order)
+
+        decision_payload = interrupt(approval_request.model_dump(mode="json"))
+
+        response = parse_human_approval_response(decision_payload)
+
+        audit_event: AuditEvent = {
+            "step": "human_approval",
+            "message": f"Human reviewer {response.decision} the proposed simulated action.",
+            "status": "ok",
+        }
+        update = {
+            "human_decision": response.decision,
+            "audit_log": [*state.get("audit_log", []), audit_event],
+        }
+
+        if response.decision == "approved":
+            return Command(update=update, goto="execute_approved_action")
+        return Command(update=update, goto="approval_rejected")
+
+    return human_approval_node
+
+
+def make_approved_action_execution_node(action_store: CustomerActionStore, executor=execute_action):
+    """Build the `execute_approved_action` node.
+
+    Only reached after `human_approval` records an "approved" decision.
+    Re-validates the preconditions the executor itself cannot infer from
+    context alone (that this specific action genuinely required approval),
+    then calls the same `execute_action` used for safe actions, explicitly
+    passing `human_approved=True` - the executor's own defense-in-depth
+    check still applies and is never bypassed.
+    """
+
+    def execute_approved_action_node(state: CustomerOpsState) -> dict:
+        if state.get("human_decision") != "approved":
+            raise ActionExecutionError(
+                f"Cannot execute: human_decision={state.get('human_decision')!r}, expected 'approved'."
+            )
+
+        proposed_action = ProposedAction.model_validate(state["proposed_action"])
+        if not proposed_action.requires_human_approval:
+            raise ActionExecutionError(
+                f"Action {proposed_action.action_type!r} does not require human approval."
+            )
+
+        action_input = ActionInputResult.model_validate(state["action_input"])
+        if not action_input.ready:
+            raise ActionExecutionError("Cannot execute: action input is not ready.")
+
+        result = executor(proposed_action, action_input, action_store, human_approved=True)
+        updated_order = action_store.get_order(result.order_id)
+
+        audit_event: AuditEvent = {
+            "step": "action_execution",
+            "message": result.message,
+            "status": "ok",
+        }
+
+        return {
+            "action_result": result.model_dump(mode="json"),
+            "order_context": _with_updated_order(state.get("order_context"), updated_order),
+            "workflow_status": "action_executed",
+            "audit_log": [*state.get("audit_log", []), audit_event],
+        }
+
+    return execute_approved_action_node
+
+
+def make_approval_rejected_node():
+    """Build the `approval_rejected` terminal node.
+
+    Only reached after `human_approval` records a "rejected" decision.
+    Performs zero mutation - `action_result` stays absent, and no
+    escalation is created automatically.
+    """
+
+    def approval_rejected_node(state: CustomerOpsState) -> dict:
+        if state.get("human_decision") != "rejected":
+            raise ApprovalError(
+                f"Cannot finalize rejection: human_decision={state.get('human_decision')!r}, "
+                "expected 'rejected'."
+            )
+
+        audit_event: AuditEvent = {
+            "step": "approval_rejected",
+            "message": "Human reviewer rejected the proposed simulated action.",
+            "status": "ok",
+        }
+
+        return {
+            "workflow_status": "approval_rejected",
+            "audit_log": [*state.get("audit_log", []), audit_event],
+        }
+
+    return approval_rejected_node
 
 
 def _route_after_action_input(state: CustomerOpsState) -> str:
@@ -532,6 +682,7 @@ def build_customer_ops_graph(
     store: CustomerOperationsStore | None = None,
     action_input_extractor: ActionInputExtractor | None = None,
     action_store: CustomerActionStore | None = None,
+    checkpointer: BaseCheckpointSaver | None = None,
 ) -> CompiledStateGraph:
     """Build and compile the Customer Operations graph.
 
@@ -542,11 +693,13 @@ def build_customer_ops_graph(
              - information -> END
              - propose_action -> prepare_action_input -> (conditional) ->
                execute_safe_action -> END, or clarification -> END
-             - prepare_approval -> prepare_approval_input -> END
-               (never executes)
+             - prepare_approval -> prepare_approval_input -> human_approval
+               -- interrupt() -- (resume) --> Command(goto=...) -> one of:
+               - execute_approved_action -> END
+               - approval_rejected -> END
              - blocked -> END
 
-    Pass fakes for any of the four dependencies (e.g. in tests) to avoid any
+    Pass fakes for any of the dependencies (e.g. in tests) to avoid any
     OpenAI dependency or real fixture files. Omitting `classifier` or
     `action_input_extractor` uses the real OpenAI-backed implementation;
     building the graph never itself makes a network call - only invoking it
@@ -554,20 +707,34 @@ def build_customer_ops_graph(
     `change_address`) reaches OpenAI.
 
     Store consistency: `store` (used for `load_context`) and `action_store`
-    (used for `execute_safe_action`) should be the SAME instance so a
-    single graph invocation reads and mutates one coherent snapshot rather
-    than two independently-loaded copies that could drift apart. When
-    both are omitted, this function constructs exactly one
-    `InMemoryCustomerActionStore.from_json()` and uses it for both -
-    `JsonCustomerOperationsStore` is used as the `store` default only when
-    `store` is customized without a matching `action_store` (or vice
-    versa), which is an intentionally narrow escape hatch, not the
+    (used for `execute_safe_action`/`execute_approved_action`) should be the
+    SAME instance so a single graph invocation reads and mutates one
+    coherent snapshot rather than two independently-loaded copies that
+    could drift apart. When both are omitted, this function constructs
+    exactly one `InMemoryCustomerActionStore.from_json()` and uses it for
+    both - `JsonCustomerOperationsStore` is used as the `store` default
+    only when `store` is customized without a matching `action_store` (or
+    vice versa), which is an intentionally narrow escape hatch, not the
     recommended path.
+
+    Checkpointing: `interrupt()`/`Command(resume=...)` require a
+    checkpointer, so once compiled, EVERY invocation of the returned graph
+    (interrupted or not) must pass `config={"configurable": {"thread_id":
+    ...}}` - the caller owns thread identity; the graph never generates or
+    derives one. Omitting `checkpointer` defaults to a fresh, process-local
+    `InMemorySaver()` (never a module-level global): state persists across
+    separate invoke/resume calls only while this Python process and this
+    saver instance stay alive - it provides no durable persistence across a
+    process restart, and is not a substitute for real business-data storage
+    (`tools/action_store.py`'s in-memory mutations are equally process-local
+    and separate from this checkpointer).
     """
     if classifier is None:
         classifier = OpenAIRequestClassifier()
     if action_input_extractor is None:
         action_input_extractor = OpenAIActionInputExtractor()
+    if checkpointer is None:
+        checkpointer = InMemorySaver()
 
     if store is None and action_store is None:
         combined_store = InMemoryCustomerActionStore.from_json()
@@ -592,6 +759,9 @@ def build_customer_ops_graph(
     graph.add_node("execute_safe_action", make_safe_action_execution_node(action_store))
     graph.add_node("prepare_approval", make_approval_preparation_node())
     graph.add_node("prepare_approval_input", make_approval_action_input_node(action_input_extractor))
+    graph.add_node("human_approval", make_human_approval_node())
+    graph.add_node("execute_approved_action", make_approved_action_execution_node(action_store))
+    graph.add_node("approval_rejected", make_approval_rejected_node())
     graph.add_node("blocked", make_blocked_node())
 
     graph.add_edge(START, "intake")
@@ -618,8 +788,12 @@ def build_customer_ops_graph(
     )
     graph.add_edge("execute_safe_action", END)
     graph.add_edge("prepare_approval", "prepare_approval_input")
-    graph.add_edge("prepare_approval_input", END)
+    graph.add_edge("prepare_approval_input", "human_approval")
+    # human_approval routes dynamically via Command(goto=...) after resume -
+    # no static edge to declare here.
+    graph.add_edge("execute_approved_action", END)
+    graph.add_edge("approval_rejected", END)
     graph.add_edge("clarification", END)
     graph.add_edge("information", END)
     graph.add_edge("blocked", END)
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)

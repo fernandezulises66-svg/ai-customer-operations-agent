@@ -3,21 +3,33 @@
 These tests cover our own behavior (validation, normalization, classification
 wiring, context loading, order resolution, policy evaluation, conditional
 routing, action proposal, action-input preparation, simulated execution,
-audit logging, workflow status) - not LangGraph internals. No test makes a
-network or OpenAI API call: `classify_request` is always exercised through
-`FakeRequestClassifier`, `load_context` through `FakeCustomerOperationsStore`
-(or `InMemoryCustomerActionStore` for tests that also need mutation), and
+human-in-the-loop approval/checkpointing, audit logging, workflow status) -
+not LangGraph internals. No test makes a network or OpenAI API call:
+`classify_request` is always exercised through `FakeRequestClassifier`,
+`load_context` through `FakeCustomerOperationsStore` (or
+`InMemoryCustomerActionStore` for tests that also need mutation), and
 `change_address` input extraction through `FakeActionInputExtractor` - all
 deterministic test doubles defined below. `resolve_order`, `evaluate_policy`,
 routing, action proposal, and action execution are already fully
 deterministic and offline, so the real implementations are used directly.
+
+Every compiled graph now carries a checkpointer, so every `.invoke(...)`
+call requires `config={"configurable": {"thread_id": ...}}`. Most tests
+don't care about a specific thread identity, so `invoke(graph, payload)`
+below supplies a shared default - safe because each test builds its own
+fresh graph (and thus fresh `InMemorySaver`), so reusing the same literal
+thread_id across different tests never collides. Tests that resume an
+interrupt, or that specifically exercise thread identity, manage their own
+`thread_config(...)` explicitly.
 """
 
 import json
 
 import pytest
+from langgraph.types import Command
 
 from customer_ops.action_inputs import AddressExtraction
+from customer_ops.approval import ApprovalError
 from customer_ops.classifier import ClassificationDecision, ClassificationError
 from customer_ops.graph import InvalidCustomerRequest, build_customer_ops_graph
 from customer_ops.models import CustomerRecord, OrderRecord
@@ -164,13 +176,61 @@ def make_action_store(
     return InMemoryCustomerActionStore(customers=list(customers.values()), orders=all_orders)
 
 
-def make_graph(classifier=None, store=None, action_input_extractor=None, action_store=None):
+class MutationCountingActionStore(InMemoryCustomerActionStore):
+    """`InMemoryCustomerActionStore` that records every mutating call.
+
+    Used by the human-in-the-loop tests to prove that no mutation happens
+    before `interrupt()`/on replay, and that an approved resume causes
+    exactly one store mutation - never zero, never more than one.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.mutation_calls: list[tuple[str, str]] = []
+
+    def cancel_order(self, order_id):
+        self.mutation_calls.append(("cancel_order", order_id))
+        return super().cancel_order(order_id)
+
+    def change_shipping_address(self, order_id, new_address):
+        self.mutation_calls.append(("change_shipping_address", order_id))
+        return super().change_shipping_address(order_id, new_address)
+
+    def issue_full_refund(self, order_id):
+        self.mutation_calls.append(("issue_full_refund", order_id))
+        return super().issue_full_refund(order_id)
+
+    def create_billing_investigation(self, order_id):
+        self.mutation_calls.append(("create_billing_investigation", order_id))
+        return super().create_billing_investigation(order_id)
+
+    def create_product_investigation(self, order_id):
+        self.mutation_calls.append(("create_product_investigation", order_id))
+        return super().create_product_investigation(order_id)
+
+
+def make_graph(classifier=None, store=None, action_input_extractor=None, action_store=None, checkpointer=None):
     return build_customer_ops_graph(
         classifier or FakeRequestClassifier(),
         store or default_store(),
         action_input_extractor or FakeActionInputExtractor(),
         action_store,
+        checkpointer,
     )
+
+
+def thread_config(thread_id: str = "test-thread-001") -> dict:
+    return {"configurable": {"thread_id": thread_id}}
+
+
+def invoke(graph, payload, thread_id: str = "test-thread-001"):
+    """Invoke a checkpointed graph using a default test thread_id.
+
+    See the module docstring for why reusing this default across tests is
+    safe. Tests that need multiple invokes on the SAME thread (resume) or a
+    specific/different thread_id build their own `thread_config(...)`.
+    """
+    return graph.invoke(payload, config=thread_config(thread_id))
 
 
 def test_graph_builds_with_injected_classifier_and_store():
@@ -180,7 +240,7 @@ def test_graph_builds_with_injected_classifier_and_store():
 
 def test_valid_request_reaches_information_ready_status():
     graph = make_graph()
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-001",
@@ -193,7 +253,7 @@ def test_valid_request_reaches_information_ready_status():
 
 def test_customer_message_is_trimmed():
     graph = make_graph()
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-001",
@@ -205,7 +265,7 @@ def test_customer_message_is_trimmed():
 
 def test_first_audit_event_is_appended():
     graph = make_graph()
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-001",
@@ -218,7 +278,7 @@ def test_first_audit_event_is_appended():
 
 def test_request_id_and_customer_id_are_preserved():
     graph = make_graph()
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-042",
             "customer_id": "cust-042",
@@ -231,7 +291,7 @@ def test_request_id_and_customer_id_are_preserved():
 
 def test_no_action_or_response_state_is_fabricated():
     graph = make_graph()
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-001",
@@ -248,7 +308,7 @@ def test_no_action_or_response_state_is_fabricated():
 def test_empty_message_is_rejected():
     graph = make_graph()
     with pytest.raises(InvalidCustomerRequest):
-        graph.invoke(
+        invoke(graph,
             {"request_id": "req-001", "customer_id": "cust-001", "customer_message": ""}
         )
 
@@ -256,7 +316,7 @@ def test_empty_message_is_rejected():
 def test_whitespace_only_message_is_rejected():
     graph = make_graph()
     with pytest.raises(InvalidCustomerRequest):
-        graph.invoke(
+        invoke(graph,
             {"request_id": "req-001", "customer_id": "cust-001", "customer_message": "   "}
         )
 
@@ -264,13 +324,13 @@ def test_whitespace_only_message_is_rejected():
 def test_missing_request_id_is_rejected():
     graph = make_graph()
     with pytest.raises(InvalidCustomerRequest):
-        graph.invoke({"customer_id": "cust-001", "customer_message": "Where is my order?"})
+        invoke(graph, {"customer_id": "cust-001", "customer_message": "Where is my order?"})
 
 
 def test_empty_request_id_is_rejected():
     graph = make_graph()
     with pytest.raises(InvalidCustomerRequest):
-        graph.invoke(
+        invoke(graph,
             {"request_id": "", "customer_id": "cust-001", "customer_message": "Where is my order?"}
         )
 
@@ -278,13 +338,13 @@ def test_empty_request_id_is_rejected():
 def test_missing_customer_id_is_rejected():
     graph = make_graph()
     with pytest.raises(InvalidCustomerRequest):
-        graph.invoke({"request_id": "req-001", "customer_message": "Where is my order?"})
+        invoke(graph, {"request_id": "req-001", "customer_message": "Where is my order?"})
 
 
 def test_empty_customer_id_is_rejected():
     graph = make_graph()
     with pytest.raises(InvalidCustomerRequest):
-        graph.invoke(
+        invoke(graph,
             {"request_id": "req-001", "customer_id": "", "customer_message": "Where is my order?"}
         )
 
@@ -297,14 +357,16 @@ def test_graph_invocation_is_deterministic():
         "customer_id": "cust-001",
         "customer_message": "  Where is my order?  ",
     }
-    result_a = graph.invoke(dict(payload))
-    result_b = graph.invoke(dict(payload))
+    # Two distinct thread_ids: two independent "cases" with the same input
+    # should produce the same output - this is not a resume.
+    result_a = graph.invoke(dict(payload), config=thread_config("det-thread-a"))
+    result_b = graph.invoke(dict(payload), config=thread_config("det-thread-b"))
     assert result_a == result_b
 
 
 def test_graph_invocation_makes_no_network_calls(no_network):
     graph = make_graph()
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-001",
@@ -316,7 +378,7 @@ def test_graph_invocation_makes_no_network_calls(no_network):
 
 def test_state_contains_only_json_friendly_data():
     graph = make_graph()
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-001",
@@ -332,7 +394,7 @@ def test_state_contains_only_json_friendly_data():
 def test_classifier_is_called_exactly_once():
     classifier = FakeRequestClassifier()
     graph = make_graph(classifier)
-    graph.invoke(
+    invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-001",
@@ -345,7 +407,7 @@ def test_classifier_is_called_exactly_once():
 def test_classifier_receives_normalized_customer_message():
     classifier = FakeRequestClassifier()
     graph = make_graph(classifier)
-    graph.invoke(
+    invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-001",
@@ -358,7 +420,7 @@ def test_classifier_receives_normalized_customer_message():
 def test_classified_intent_enters_state():
     classifier = FakeRequestClassifier(intent="refund_request", urgency="medium")
     graph = make_graph(classifier)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-001",
@@ -371,7 +433,7 @@ def test_classified_intent_enters_state():
 def test_classified_urgency_enters_state():
     classifier = FakeRequestClassifier(intent="refund_request", urgency="medium")
     graph = make_graph(classifier)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-001",
@@ -384,7 +446,7 @@ def test_classified_urgency_enters_state():
 def test_classification_audit_event_is_appended():
     classifier = FakeRequestClassifier(intent="refund_request", urgency="medium")
     graph = make_graph(classifier)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-001",
@@ -401,7 +463,7 @@ def test_classifier_failure_propagates():
     classifier = FakeRequestClassifier(exc=ClassificationError("simulated classification failure"))
     graph = make_graph(classifier)
     with pytest.raises(ClassificationError):
-        graph.invoke(
+        invoke(graph,
             {
                 "request_id": "req-001",
                 "customer_id": "cust-001",
@@ -416,7 +478,7 @@ def test_classifier_failure_propagates():
 def test_context_store_customer_lookup_called_with_correct_customer_id():
     store = FakeCustomerOperationsStore(customers={"cust-777": make_customer("cust-777")})
     graph = make_graph(store=store)
-    graph.invoke(
+    invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -429,7 +491,7 @@ def test_context_store_customer_lookup_called_with_correct_customer_id():
 def test_customer_orders_lookup_called_with_correct_customer_id():
     store = FakeCustomerOperationsStore(customers={"cust-777": make_customer("cust-777")})
     graph = make_graph(store=store)
-    graph.invoke(
+    invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -443,7 +505,7 @@ def test_customer_context_populated_from_store():
     customer = make_customer("cust-777", name="Priya Shah", customer_tier="premium")
     store = FakeCustomerOperationsStore(customers={"cust-777": customer})
     graph = make_graph(store=store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -462,7 +524,7 @@ def test_order_context_populated_from_store():
         orders_by_customer={"cust-777": [order_a, order_b]},
     )
     graph = make_graph(store=store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -482,7 +544,7 @@ def test_context_loading_audit_event_appended():
         orders_by_customer={"cust-777": [make_order("order-aaa", "cust-777")]},
     )
     graph = make_graph(store=store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -508,7 +570,7 @@ def test_audit_log_does_not_contain_customer_or_order_details():
         customers={"cust-777": customer}, orders_by_customer={"cust-777": [order]}
     )
     graph = make_graph(store=store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -525,7 +587,7 @@ def test_unknown_customer_failure_propagates():
     store = FakeCustomerOperationsStore(customers={})
     graph = make_graph(store=store)
     with pytest.raises(CustomerNotFoundError):
-        graph.invoke(
+        invoke(graph,
             {
                 "request_id": "req-001",
                 "customer_id": "cust-does-not-exist",
@@ -537,7 +599,7 @@ def test_unknown_customer_failure_propagates():
 def test_customer_with_zero_orders_is_valid():
     store = FakeCustomerOperationsStore(customers={"cust-777": make_customer("cust-777")})
     graph = make_graph(store=store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -562,7 +624,7 @@ def test_explicit_known_order_id_reaches_selected_order_id():
     )
     classifier = FakeRequestClassifier(intent="order_status", urgency="low")
     graph = make_graph(classifier, store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -582,7 +644,7 @@ def test_no_order_id_produces_needs_clarification():
     )
     classifier = FakeRequestClassifier(intent="order_status", urgency="low")
     graph = make_graph(classifier, store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -600,7 +662,7 @@ def test_order_resolution_audit_event_appended():
     )
     classifier = FakeRequestClassifier(intent="order_status", urgency="low")
     graph = make_graph(classifier, store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -622,7 +684,7 @@ def test_policy_assessment_populated():
     )
     classifier = FakeRequestClassifier(intent="cancel_order", urgency="medium")
     graph = make_graph(classifier, store, action_store=store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -641,7 +703,7 @@ def test_policy_evaluation_audit_event_appended():
     )
     classifier = FakeRequestClassifier(intent="order_status", urgency="low")
     graph = make_graph(classifier, store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -660,7 +722,7 @@ def test_exactly_six_workflow_audit_stages():
     )
     classifier = FakeRequestClassifier(intent="order_status", urgency="low")
     graph = make_graph(classifier, store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -685,7 +747,7 @@ def test_customer_and_order_facts_unchanged_after_policy_evaluation():
     )
     classifier = FakeRequestClassifier(intent="order_status", urgency="low")
     graph = make_graph(classifier, store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -708,7 +770,7 @@ def test_clarification_branch_for_ambiguous_order_reference():
     )
     classifier = FakeRequestClassifier(intent="cancel_order", urgency="medium")
     graph = make_graph(classifier, store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -728,7 +790,7 @@ def test_information_branch_for_order_status_with_explicit_order():
     )
     classifier = FakeRequestClassifier(intent="order_status", urgency="low")
     graph = make_graph(classifier, store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -749,7 +811,7 @@ def test_safe_cancellation_executes_and_updates_order_state():
     )
     classifier = FakeRequestClassifier(intent="cancel_order", urgency="medium")
     graph = make_graph(classifier, store, action_store=store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -786,6 +848,9 @@ def test_safe_cancellation_executes_and_updates_order_state():
         "action_input",
         "action_execution",
     ]
+    # Safe actions complete in a single invoke - no pause, no human decision.
+    assert "__interrupt__" not in result
+    assert "human_decision" not in result
 
 
 def test_address_change_with_explicit_address_executes():
@@ -798,7 +863,7 @@ def test_address_change_with_explicit_address_executes():
     extractor = FakeActionInputExtractor(address=new_address)
     classifier = FakeRequestClassifier(intent="address_change", urgency="medium")
     graph = make_graph(classifier, store, action_input_extractor=extractor, action_store=store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -811,6 +876,9 @@ def test_address_change_with_explicit_address_executes():
     assert result["workflow_status"] == "action_executed"
     assert result["order_context"]["orders"][0]["shipping_address"] == new_address
     assert extractor.calls == [f"Please change the address on order-aaa to {new_address}."]
+    # Safe actions complete in a single invoke - no pause, no human decision.
+    assert "__interrupt__" not in result
+    assert "human_decision" not in result
 
 
 def test_address_change_without_new_address_requires_clarification():
@@ -822,7 +890,7 @@ def test_address_change_without_new_address_requires_clarification():
     extractor = FakeActionInputExtractor(address=None)
     classifier = FakeRequestClassifier(intent="address_change", urgency="medium")
     graph = make_graph(classifier, store, action_input_extractor=extractor, action_store=store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -848,7 +916,7 @@ def test_approval_branch_for_refund_on_delivered_paid_order():
     )
     classifier = FakeRequestClassifier(intent="refund_request", urgency="high")
     graph = make_graph(classifier, store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -883,7 +951,7 @@ def test_billing_issue_approval_branch_does_not_execute():
     )
     classifier = FakeRequestClassifier(intent="billing_issue", urgency="high")
     graph = make_graph(classifier, store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -905,7 +973,7 @@ def test_product_issue_approval_branch_does_not_execute():
     )
     classifier = FakeRequestClassifier(intent="product_issue", urgency="medium")
     graph = make_graph(classifier, store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -929,7 +997,7 @@ def test_audit_log_does_not_contain_new_shipping_address():
     extractor = FakeActionInputExtractor(address=new_address)
     classifier = FakeRequestClassifier(intent="address_change", urgency="medium")
     graph = make_graph(classifier, store, action_input_extractor=extractor, action_store=store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -948,7 +1016,7 @@ def test_action_execution_makes_no_network_calls(no_network):
     )
     classifier = FakeRequestClassifier(intent="cancel_order", urgency="medium")
     graph = make_graph(classifier, store, action_store=store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -971,7 +1039,7 @@ def test_graph_execution_does_not_modify_real_fixture_files():
         action_store=action_store,
     )
     # order-1004 is 'processing' for cust-002 in the real fixture - eligible.
-    graph.invoke(
+    invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-002",
@@ -991,7 +1059,7 @@ def test_blocked_branch_for_address_change_on_shipped_order():
     )
     classifier = FakeRequestClassifier(intent="address_change", urgency="medium")
     graph = make_graph(classifier, store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -1008,7 +1076,7 @@ def test_information_branch_for_other_intent():
     store = FakeCustomerOperationsStore(customers={"cust-777": make_customer("cust-777")})
     classifier = FakeRequestClassifier(intent="other", urgency="low")
     graph = make_graph(classifier, store)
-    result = graph.invoke(
+    result = invoke(graph,
         {
             "request_id": "req-001",
             "customer_id": "cust-777",
@@ -1026,7 +1094,12 @@ def test_information_branch_for_other_intent():
     [
         ("cancel_order", "processing", "paid", "Please cancel order-aaa."),
         ("address_change", "shipped", "paid", "Please change the address on order-aaa."),
-        ("refund_request", "delivered", "paid", "I would like a refund for order-aaa."),
+        # Deliberately NOT an approval-required intent here: an interrupted
+        # result's `__interrupt__` entry carries a randomly-generated
+        # `Interrupt.id`, so it is neither JSON-serializable as-is nor
+        # equal across two separate runs - see the dedicated HITL tests
+        # below for interrupt/resume-specific coverage instead.
+        ("cancel_order", "shipped", "paid", "I want to cancel my order."),
         ("order_status", "shipped", "paid", "Where is order-aaa?"),
     ],
 )
@@ -1043,7 +1116,367 @@ def test_routed_results_are_json_serializable_and_deterministic(
         return make_graph(classifier, store, action_store=store)
 
     payload = {"request_id": "req-001", "customer_id": "cust-777", "customer_message": message}
-    result_a = build_graph().invoke(dict(payload))
-    result_b = build_graph().invoke(dict(payload))
+    result_a = invoke(build_graph(), dict(payload))
+    result_b = invoke(build_graph(), dict(payload))
     json.dumps(result_a)  # raises TypeError if anything is not JSON-serializable
     assert result_a == result_b
+
+
+# --- human-in-the-loop approval (interrupt / checkpoint / resume) ------------
+
+
+def test_refund_approval_pauses_at_interrupt():
+    """A. refund pauses."""
+    order = make_order("order-aaa", "cust-777", status="delivered", payment_status="paid", total=79.0)
+    store = make_action_store(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={"cust-777": [order]},
+    )
+    classifier = FakeRequestClassifier(intent="refund_request", urgency="high")
+    graph = make_graph(classifier, store, action_store=store)
+    config = thread_config("refund-pauses")
+
+    result = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "I would like a refund for order-aaa.",
+        },
+        config=config,
+    )
+
+    assert "__interrupt__" in result
+    assert result["workflow_status"] == "awaiting_approval"
+    assert "action_result" not in result
+    assert "human_decision" not in result
+    assert result["order_context"]["orders"][0]["payment_status"] == "paid"
+
+    interrupt_payload = result["__interrupt__"][0].value
+    assert interrupt_payload == {
+        "request_id": "req-001",
+        "action_type": "issue_refund",
+        "order_id": "order-aaa",
+        "message": "Approve simulated full refund for order order-aaa?",
+        "amount": 79.0,
+        "currency": "USD",
+    }
+
+
+def test_refund_approved_executes_and_mutates_exactly_once():
+    """B. refund approved."""
+    order = make_order("order-aaa", "cust-777", status="delivered", payment_status="paid", total=79.0)
+    store = MutationCountingActionStore(customers=[make_customer("cust-777")], orders=[order])
+    classifier = FakeRequestClassifier(intent="refund_request", urgency="high")
+    graph = make_graph(classifier, store, action_store=store)
+    config = thread_config("refund-approved")
+
+    graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "I would like a refund for order-aaa.",
+        },
+        config=config,
+    )
+    result = graph.invoke(Command(resume={"decision": "approved"}), config=config)
+
+    assert result["human_decision"] == "approved"
+    assert result["order_context"]["orders"][0]["payment_status"] == "refunded"
+    assert result["action_result"]["success"] is True
+    assert result["action_result"]["action_type"] == "issue_refund"
+    assert result["workflow_status"] == "action_executed"
+    assert result["audit_log"][-1]["step"] == "action_execution"
+    assert store.mutation_calls == [("issue_full_refund", "order-aaa")]
+
+
+def test_refund_rejected_performs_no_mutation():
+    """C. refund rejected."""
+    order = make_order("order-aaa", "cust-777", status="delivered", payment_status="paid", total=79.0)
+    store = MutationCountingActionStore(customers=[make_customer("cust-777")], orders=[order])
+    classifier = FakeRequestClassifier(intent="refund_request", urgency="high")
+    graph = make_graph(classifier, store, action_store=store)
+    config = thread_config("refund-rejected")
+
+    graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "I would like a refund for order-aaa.",
+        },
+        config=config,
+    )
+    result = graph.invoke(Command(resume={"decision": "rejected"}), config=config)
+
+    assert result["human_decision"] == "rejected"
+    assert "action_result" not in result
+    assert result["workflow_status"] == "approval_rejected"
+    assert result["audit_log"][-1]["step"] == "approval_rejected"
+    assert result["order_context"]["orders"][0]["payment_status"] == "paid"
+    assert store.mutation_calls == []
+
+
+def test_billing_investigation_approved_creates_investigation_once():
+    """D. billing investigation approved."""
+    order = make_order("order-aaa", "cust-777", status="delivered")
+    store = MutationCountingActionStore(customers=[make_customer("cust-777")], orders=[order])
+    classifier = FakeRequestClassifier(intent="billing_issue", urgency="high")
+    graph = make_graph(classifier, store, action_store=store)
+    config = thread_config("billing-approved")
+
+    initial = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "I was charged twice for order-aaa.",
+        },
+        config=config,
+    )
+    assert "__interrupt__" in initial
+    assert store.mutation_calls == []  # nothing happens before resume
+
+    result = graph.invoke(Command(resume={"decision": "approved"}), config=config)
+
+    assert result["action_result"]["success"] is True
+    assert result["action_result"]["action_type"] == "investigate_billing"
+    assert result["action_result"]["reference_id"] == "billing-investigation-order-aaa"
+    assert result["workflow_status"] == "action_executed"
+    assert store.mutation_calls == [("create_billing_investigation", "order-aaa")]
+
+
+def test_billing_investigation_rejected_creates_no_investigation():
+    """E. billing investigation rejected."""
+    order = make_order("order-aaa", "cust-777", status="delivered")
+    store = MutationCountingActionStore(customers=[make_customer("cust-777")], orders=[order])
+    classifier = FakeRequestClassifier(intent="billing_issue", urgency="high")
+    graph = make_graph(classifier, store, action_store=store)
+    config = thread_config("billing-rejected")
+
+    graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "I was charged twice for order-aaa.",
+        },
+        config=config,
+    )
+    result = graph.invoke(Command(resume={"decision": "rejected"}), config=config)
+
+    assert "action_result" not in result
+    assert result["workflow_status"] == "approval_rejected"
+    assert store.mutation_calls == []
+
+
+def test_product_investigation_approved_executes_only_after_resume():
+    """F. product investigation approved."""
+    order = make_order("order-aaa", "cust-777", status="delivered")
+    store = MutationCountingActionStore(customers=[make_customer("cust-777")], orders=[order])
+    classifier = FakeRequestClassifier(intent="product_issue", urgency="medium")
+    graph = make_graph(classifier, store, action_store=store)
+    config = thread_config("product-approved")
+
+    initial = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "The item in order-aaa arrived broken.",
+        },
+        config=config,
+    )
+    assert "__interrupt__" in initial
+    assert store.mutation_calls == []
+
+    result = graph.invoke(Command(resume={"decision": "approved"}), config=config)
+
+    assert result["action_result"]["success"] is True
+    assert result["action_result"]["action_type"] == "investigate_product_issue"
+    assert result["action_result"]["reference_id"] == "product-investigation-order-aaa"
+    assert store.mutation_calls == [("create_product_investigation", "order-aaa")]
+
+
+def test_product_investigation_rejected_performs_no_mutation():
+    """G. product investigation rejected."""
+    order = make_order("order-aaa", "cust-777", status="delivered")
+    store = MutationCountingActionStore(customers=[make_customer("cust-777")], orders=[order])
+    classifier = FakeRequestClassifier(intent="product_issue", urgency="medium")
+    graph = make_graph(classifier, store, action_store=store)
+    config = thread_config("product-rejected")
+
+    graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "The item in order-aaa arrived broken.",
+        },
+        config=config,
+    )
+    result = graph.invoke(Command(resume={"decision": "rejected"}), config=config)
+
+    assert "action_result" not in result
+    assert result["workflow_status"] == "approval_rejected"
+    assert store.mutation_calls == []
+
+
+def test_blocked_information_clarification_remain_non_interrupting():
+    """J. blocked/information/clarification remain non-interrupting."""
+    blocked_order = make_order("order-aaa", "cust-777", status="shipped")
+    blocked_store = make_action_store(
+        customers={"cust-777": make_customer("cust-777")}, orders_by_customer={"cust-777": [blocked_order]}
+    )
+    blocked_result = invoke(
+        make_graph(FakeRequestClassifier(intent="address_change", urgency="medium"), blocked_store, action_store=blocked_store),
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "Please change the address on order-aaa.",
+        },
+        thread_id="blocked-non-interrupting",
+    )
+    assert "__interrupt__" not in blocked_result
+
+    info_result = invoke(
+        make_graph(FakeRequestClassifier(intent="other", urgency="low"), default_store()),
+        {"request_id": "req-001", "customer_id": "cust-001", "customer_message": "Do you sell gift cards?"},
+        thread_id="information-non-interrupting",
+    )
+    assert "__interrupt__" not in info_result
+
+    clarification_result = invoke(
+        make_graph(FakeRequestClassifier(intent="cancel_order", urgency="medium"), default_store()),
+        {"request_id": "req-001", "customer_id": "cust-001", "customer_message": "I want to cancel my order."},
+        thread_id="clarification-non-interrupting",
+    )
+    assert "__interrupt__" not in clarification_result
+
+
+def test_resuming_with_wrong_thread_id_does_not_resume_pending_approval():
+    """K. wrong thread ID does not resume the pending approval."""
+    order = make_order("order-aaa", "cust-777", status="delivered", payment_status="paid")
+    store = make_action_store(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={"cust-777": [order]},
+    )
+    classifier = FakeRequestClassifier(intent="refund_request", urgency="high")
+    graph = make_graph(classifier, store, action_store=store)
+    real_config = thread_config("refund-real-thread")
+
+    graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "I would like a refund for order-aaa.",
+        },
+        config=real_config,
+    )
+
+    wrong_config = thread_config("refund-wrong-thread")
+    # No checkpoint exists for this thread_id, so the graph runs fresh from
+    # START with no payload at all - intake rejects it explicitly rather
+    # than silently resuming the OTHER thread's pending approval.
+    with pytest.raises(InvalidCustomerRequest):
+        graph.invoke(Command(resume={"decision": "approved"}), config=wrong_config)
+
+    # The real thread's pending approval, and the order, are untouched.
+    assert store.get_order("order-aaa").payment_status == "paid"
+
+
+def test_malformed_resume_payload_fails_explicitly_without_mutation():
+    """L. malformed resume payload fails explicitly and does not mutate."""
+    order = make_order("order-aaa", "cust-777", status="delivered", payment_status="paid")
+    store = make_action_store(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={"cust-777": [order]},
+    )
+    classifier = FakeRequestClassifier(intent="refund_request", urgency="high")
+    graph = make_graph(classifier, store, action_store=store)
+    config = thread_config("refund-malformed")
+
+    graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "I would like a refund for order-aaa.",
+        },
+        config=config,
+    )
+
+    with pytest.raises(ApprovalError):
+        graph.invoke(Command(resume={"decision": "maybe"}), config=config)
+
+    assert store.get_order("order-aaa").payment_status == "paid"
+
+
+def test_no_mutation_before_interrupt_and_exactly_one_on_approved_resume():
+    """M. repeated node execution safety."""
+    order = make_order("order-aaa", "cust-777", status="delivered", payment_status="paid", total=50.0)
+    store = MutationCountingActionStore(customers=[make_customer("cust-777")], orders=[order])
+    classifier = FakeRequestClassifier(intent="refund_request", urgency="high")
+    graph = make_graph(classifier, store, action_store=store)
+    config = thread_config("refund-replay-safety")
+
+    initial = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "I would like a refund for order-aaa.",
+        },
+        config=config,
+    )
+    assert "__interrupt__" in initial
+    assert store.mutation_calls == []
+
+    result = graph.invoke(Command(resume={"decision": "approved"}), config=config)
+    assert store.mutation_calls == [("issue_full_refund", "order-aaa")]
+    assert result["action_result"]["success"] is True
+
+
+def test_interrupt_payload_excludes_pii():
+    """Approval payload privacy: no email, address, or full context."""
+    customer = make_customer("cust-777", email="priya.shah@example.com")
+    order = make_order(
+        "order-aaa",
+        "cust-777",
+        status="delivered",
+        payment_status="paid",
+        total=79.0,
+        shipping_address="900 Confidential Ave, Privacy City, PC 00001, USA",
+    )
+    store = make_action_store(customers={"cust-777": customer}, orders_by_customer={"cust-777": [order]})
+    classifier = FakeRequestClassifier(intent="refund_request", urgency="high")
+    graph = make_graph(classifier, store, action_store=store)
+    config = thread_config("refund-pii-check")
+
+    result = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "I would like a refund for order-aaa.",
+        },
+        config=config,
+    )
+
+    interrupt_payload = result["__interrupt__"][0].value
+    assert set(interrupt_payload) == {"request_id", "action_type", "order_id", "message", "amount", "currency"}
+    assert customer.email not in str(interrupt_payload)
+    assert order.shipping_address not in str(interrupt_payload)
+
+
+def test_hitl_flow_makes_no_network_calls(no_network):
+    order = make_order("order-aaa", "cust-777", status="delivered", payment_status="paid")
+    store = make_action_store(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={"cust-777": [order]},
+    )
+    classifier = FakeRequestClassifier(intent="refund_request", urgency="high")
+    graph = make_graph(classifier, store, action_store=store)
+    config = thread_config("refund-no-network")
+
+    graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "I would like a refund for order-aaa.",
+        },
+        config=config,
+    )
+    result = graph.invoke(Command(resume={"decision": "approved"}), config=config)
+    assert result["workflow_status"] == "action_executed"

@@ -49,6 +49,7 @@ def test_workflow_status_values_are_the_documented_set():
         "action_proposed",
         "action_input_ready",
         "awaiting_approval",
+        "approval_rejected",
         "blocked",
         "action_executed",
         "escalated",

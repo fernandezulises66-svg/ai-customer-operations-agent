@@ -36,6 +36,7 @@ WorkflowStatus = Literal[
     "action_proposed",
     "action_input_ready",
     "awaiting_approval",
+    "approval_rejected",
     "blocked",
     "action_executed",
     "escalated",
@@ -166,12 +167,16 @@ class CustomerOpsState(TypedDict):
     proposed_action: NotRequired[dict[str, Any] | None]
     action_input: NotRequired[dict[str, Any] | None]
 
-    # Human-in-the-loop (future iterations)
+    # Human-in-the-loop: the external reviewer's decision, supplied only via
+    # Command(resume=...) after interrupt() - never derived from policy,
+    # intent, urgency, or any model output.
     human_decision: NotRequired[HumanDecision | None]
 
-    # Execution outcome. Populated only for safe actions (cancel_order,
-    # change_address) executed against the simulated in-memory operational
-    # store - approval-required actions never execute in this iteration.
+    # Execution outcome. Populated for safe actions (cancel_order,
+    # change_address) executed directly, and for approval-required actions
+    # (issue_refund, investigate_billing, investigate_product_issue)
+    # executed only after an explicit "approved" human decision. Stays
+    # absent when rejected or when awaiting approval.
     action_result: NotRequired[dict[str, Any] | None]
 
     # Final output

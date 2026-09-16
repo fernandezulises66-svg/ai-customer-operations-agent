@@ -2,8 +2,9 @@
 
 **Status: intake + classification + context loading + deterministic order
 resolution, policy evaluation, conditional routing, structured action
-proposals, and simulated safe-action execution (Iteration 6).** This is a
-portfolio project and is not production software.
+proposals, simulated safe-action execution, and human-in-the-loop approval
+with LangGraph checkpointing (Iteration 7).** This is a portfolio project
+and is not production software.
 
 > Mercora is a fictional e-commerce company invented for this project. All
 > customers, orders, policies, payments, addresses, and tickets referenced
@@ -48,125 +49,119 @@ observability.
   `CustomerActionStore`, kept as separate interfaces even where one class
   implements both.
 - Sensitive/high-impact simulated actions require a **human-in-the-loop**
-  approval step before execution. That interrupt/resume step does not exist
-  yet (Iteration 6 prepares validated execution input for it but never
-  executes an approval-required action); `issue_refund`,
-  `investigate_billing`, and `investigate_product_issue` currently stop at
-  `awaiting_approval`.
+  approval step before execution: a real LangGraph `interrupt()` pauses the
+  graph, and execution resumes only via `Command(resume=...)` carrying an
+  explicit approved/rejected decision.
 - The workflow state is checkpoint-friendly and produces a **structured audit
   trail** of observable events (not model reasoning).
 
-## Current implementation (Iteration 6: Action Inputs and Simulated Execution)
+## Current implementation (Iteration 7: Human-in-the-Loop Approval and Checkpointing)
 
 The full pipeline from a customer message to a simulated operational change
-now exists:
+now exists, including a genuine pause-for-human-approval step:
 
 **Policy** (what is allowed) **-> Routing** (which workflow path follows)
 **-> Proposed Action** (what operation is intended) **-> Action Input**
-(what validated parameters it needs) **-> Executor** (calls exactly one
-store method) **-> Simulated Store** (the in-memory mutation).
+(what validated parameters it needs) **-> `interrupt()`** (sensitive actions
+only - pause and wait for a human) **-> Executor** (calls exactly one store
+method, only after approval) **-> Simulated Store** (the in-memory mutation).
 
 - **LLM**: intent + urgency interpretation, and - only for `change_address`
   - structured address extraction (`customer_ops/classifier.py`,
   `customer_ops/action_inputs.py`).
 - **Deterministic data store**: customer/order facts (`tools/customer_data.py`).
-- **Deterministic resolver**: which order a request refers to
-  (`customer_ops/order_resolution.py`).
-- **Deterministic policy engine**: operational eligibility
-  (`customer_ops/policies.py`).
-- **Deterministic router**: which workflow branch follows from that policy
-  result (`customer_ops/routing.py`).
-- **Structured action proposals**: what a future action *would* do
-  (`customer_ops/action_proposal.py`).
-- **Structured action inputs**: the validated parameters an action needs
-  before it can run, never invented (`customer_ops/action_inputs.py`).
+- **Deterministic resolver / policy engine / router**: order selection,
+  eligibility, and branch selection (`customer_ops/order_resolution.py`,
+  `customer_ops/policies.py`, `customer_ops/routing.py`).
+- **Structured action proposals and inputs**: what a future action would do
+  and what validated parameters it needs, never invented
+  (`customer_ops/action_proposal.py`, `customer_ops/action_inputs.py`).
+- **Human-in-the-loop approval**: a real LangGraph `interrupt()` that pauses
+  the graph and exposes a minimal, PII-free `ApprovalRequest`; the human
+  decision comes only from external `Command(resume=...)` input - never
+  from the LLM, policy, intent, or urgency (`customer_ops/approval.py`).
 - **Simulated execution**: exactly one mutation call against an in-memory
-  operational store, for safe actions only (`customer_ops/action_executor.py`,
-  `tools/action_store.py`).
+  operational store - for safe actions immediately, for sensitive actions
+  only after an explicit "approved" decision
+  (`customer_ops/action_executor.py`, `tools/action_store.py`).
 
 Implemented now:
 
-- **Explicit action-input contracts** (`customer_ops/action_inputs.py`):
-  `CancelOrderInput`, `ChangeAddressInput`, `RefundInput`,
-  `InvestigationInput` - one Pydantic model per action type - and
-  `ActionInputResult` (`ready`, `action_type`, `parameters`,
-  `missing_fields`). `cancel_order`, `issue_refund`, and both investigation
-  types build their input deterministically (just `order_id`); only
-  `change_address` needs a customer-supplied value not already in hand.
-- **Structured address extraction** for `change_address`
-  (`OpenAIActionInputExtractor`, via `ActionInputExtractor`): one OpenAI
-  Responses API Structured Outputs call that returns only the address the
-  customer explicitly typed - never inferred, completed, or guessed. No
-  address means `ActionInputResult(ready=False,
-  missing_fields=["new_shipping_address"])`, never an invented address.
-- **A simulated in-memory mutable operational layer**
-  (`tools/action_store.py`): `InMemoryCustomerActionStore` implements both
-  the read-only `CustomerOperationsStore` protocol and a new mutating
-  `CustomerActionStore` protocol (`cancel_order`, `change_shipping_address`,
-  `issue_full_refund`, `create_billing_investigation`,
-  `create_product_investigation`) against the *same* in-memory records, so
-  one graph invocation always sees a coherent snapshot rather than two
-  independently-loaded copies that could drift apart. `data/customers.json`
-  and `data/orders.json` are never written to - mutations live only in that
-  store instance's memory for the life of the process.
-- **Safe action execution** (`customer_ops/action_executor.py`,
-  `execute_action`): converts a validated `ProposedAction` +
-  `ActionInputResult` into exactly one `CustomerActionStore` call and
-  returns a structured `ActionResult` (`action_type`, `success`,
-  `order_id`, `message`, optional `reference_id`). Contract mismatches,
-  not-ready input, unsupported action types, and store failures all raise
-  `ActionExecutionError` - never a fake success.
-- **Defense-in-depth approval gate at the executor boundary**:
-  `execute_action(..., human_approved=...)` refuses to run `issue_refund`,
-  `investigate_billing`, or `investigate_product_issue` unless
-  `human_approved=True` is passed explicitly - enforced even though the
-  graph in this iteration never calls the executor for those action types
-  at all.
-- **Graph changes**: the safe-action branch now runs
-  `propose_action -> prepare_action_input -> (conditional) ->
-  execute_safe_action` (ready) or back to `clarification` (missing input -
-  nothing is guessed, and the proposal is kept in state for traceability).
-  The approval branch runs `prepare_approval -> prepare_approval_input ->
-  awaiting_approval` and still never executes.
-- **State synchronization after mutation**: a successful safe execution
-  re-reads the affected order from the same store and replaces only that
-  order's entry in `order_context` - graph state never shows stale data,
-  and no other order is touched.
+- **`customer_ops/approval.py`**: `ApprovalRequest` (`request_id`,
+  `action_type`, `order_id`, `message`, optional `amount`/`currency` for
+  `issue_refund` derived from the validated order) and
+  `HumanApprovalResponse` (`decision: "approved" | "rejected"`, using the
+  existing `HumanDecision` vocabulary). Never includes customer email,
+  shipping address, or a full customer/order record. A malformed resume
+  payload raises `ApprovalError` - it is never silently interpreted.
+- **`human_approval` node**: reads the already-prepared `ProposedAction` and
+  `ActionInputResult`, builds the `ApprovalRequest`, then calls
+  `interrupt(approval_request.model_dump(mode="json"))`. Because LangGraph
+  re-executes an interrupted node from its beginning on every resume,
+  everything before `interrupt()` here is a pure read/validation - no
+  mutation, no network call, no audit-log append happens until after the
+  human's decision comes back. On resume, it validates the decision and
+  returns `Command(update=..., goto="execute_approved_action" |
+  "approval_rejected")` - LangGraph-native resume routing.
+- **`execute_approved_action` node**: only reached after an "approved"
+  decision. Re-validates that the action genuinely required approval and
+  that its input is ready, then calls the *same* `execute_action` used for
+  safe actions, explicitly passing `human_approved=True` - the executor's
+  own defense-in-depth check from Iteration 6 still applies and is never
+  bypassed. Synchronizes `order_context` exactly like safe execution does.
+- **`approval_rejected` node**: performs zero mutation; `action_result`
+  stays absent; no automatic escalation.
+- **Checkpointing**: `build_customer_ops_graph(..., checkpointer=None)`
+  defaults to a fresh, process-local `InMemorySaver()` (never a module-level
+  global). Once compiled, *every* invocation - interrupted or not - requires
+  `config={"configurable": {"thread_id": ...}}`; the graph never generates
+  or derives a thread_id, the caller owns thread identity.
+- **Resume safety, proven by tests**: no store mutation happens before
+  `interrupt()` or on node replay; an approved resume causes exactly one
+  store mutation; resuming with an unrelated/unknown thread_id does not
+  resume the pending approval (the fresh run hits `intake`'s own explicit
+  validation instead); a malformed resume decision raises `ApprovalError`
+  without mutating anything.
 - LangGraph workflow:
-  `START -> intake -> classify_request -> load_context -> resolve_order -> evaluate_policy -> (conditional) -> {clarification, information, propose_action -> prepare_action_input -> (conditional) -> {execute_safe_action, clarification}, prepare_approval -> prepare_approval_input, blocked} -> END`,
-  built via `build_customer_ops_graph(classifier=None, store=None, action_input_extractor=None, action_store=None)`.
-- Observable audit events for every stage, including `action_input` and
-  `action_execution` (e.g. "Additional action input is required:
-  new_shipping_address.") - never the actual address text, hidden
-  reasoning, or other customer/order PII.
-- A minimal `app.py` placeholder entry point (no CLI, no OpenAI call).
+  `START -> intake -> classify_request -> load_context -> resolve_order -> evaluate_policy -> (conditional) -> {clarification, information, propose_action -> prepare_action_input -> (conditional) -> {execute_safe_action, clarification}, prepare_approval -> prepare_approval_input -> human_approval -- interrupt() -- (resume) --> {execute_approved_action, approval_rejected}, blocked} -> END`,
+  built via `build_customer_ops_graph(classifier=None, store=None, action_input_extractor=None, action_store=None, checkpointer=None)`.
+- Observable audit events for every stage, including `human_approval` (e.g.
+  "Human reviewer approved the proposed simulated action.") and
+  `approval_rejected` - never reviewer identity, timestamps, or hidden
+  reasoning.
+- A minimal `app.py` placeholder entry point (no CLI, no OpenAI call, no
+  interactive approval CLI yet).
 - Unit tests for state contracts, models, the data store, the classifier,
   order resolution, policy evaluation, routing, action proposal, action
-  inputs, the action store, the action executor, and full graph branch
-  coverage - all running with no network access and no API key.
+  inputs, the action store, the action executor, approval contracts, and
+  full graph branch/HITL coverage - all running with no network access and
+  no API key.
 
-**Important limitations, stated accurately**: every mutation is simulated
-and lives only in that process's memory - a restart resets it completely.
-No real money, orders, or customer systems are ever touched. The JSON
-fixtures remain example source data, not persistent business storage; this
-is not the same thing as the LangGraph checkpointing that arrives in a
-later iteration (that persists *workflow* state, not business data).
+**Important limitations, stated accurately**: `InMemorySaver` checkpoint
+state survives separate invoke/resume calls only while this Python process
+and this saver instance stay alive - it provides **no durable persistence
+across a process restart**, and it is a different concern entirely from the
+simulated business-data mutations in `tools/action_store.py` (also
+process-local). No real money, orders, or customer systems are ever
+touched. The JSON fixtures remain example source data, not persistent
+business storage.
 
 Planned later (not implemented yet):
 
-- LangGraph human interrupt/resume (`interrupt()` / `Command(resume=...)`)
-  and the actual approval workflow.
-- Checkpointing / thread persistence.
 - Final customer-facing response generation.
 - Evaluation harness (`evals/`).
 - Streamlit UI.
 - Deployment.
+- Durable checkpoint/business-data persistence (a future improvement beyond
+  `InMemorySaver`).
 
 ## Tech stack
 
 - Python 3.13+
 - [LangGraph](https://github.com/langchain-ai/langgraph) `>=1.1,<2.0` for
-  orchestration
+  orchestration, including `interrupt()`/`Command(resume=...)` for
+  human-in-the-loop and `InMemorySaver` (from `langgraph-checkpoint`,
+  already a LangGraph dependency) for demo/development checkpointing
 - [OpenAI SDK](https://github.com/openai/openai-python) `>=3.0,<4.0`, used via
   the Responses API structured-output path (`responses.parse`)
 - [Pydantic](https://github.com/pydantic/pydantic) `>=2.0,<3.0`
@@ -190,6 +185,7 @@ ai-customer-operations-agent/
 │   ├── action_proposal.py  # ProposedAction, propose_action() - structured action intent
 │   ├── action_inputs.py    # ActionInputResult, prepare_action_input(), address extraction
 │   ├── action_executor.py  # ActionResult, execute_action() - one simulated mutation call
+│   ├── approval.py         # ApprovalRequest, HumanApprovalResponse - HITL contracts
 │   └── graph.py            # all graph nodes, build_customer_ops_graph()
 │
 ├── tools/
@@ -218,6 +214,7 @@ ai-customer-operations-agent/
 │   ├── test_action_inputs.py
 │   ├── test_action_store.py
 │   ├── test_action_executor.py
+│   ├── test_approval.py
 │   └── test_graph.py
 │
 ├── app.py                # minimal placeholder entry point
@@ -240,8 +237,8 @@ python -m venv .venv
 Copy `.env.example` to `.env` and set `OPENAI_API_KEY` to run the graph for
 real (i.e. invoke it without injecting fakes). No key is required to run the
 test suite — tests always inject a fake `RequestClassifier`, a fake/in-memory
-`CustomerOperationsStore`, and a fake `ActionInputExtractor`, and make no
-network calls:
+`CustomerOperationsStore`, and a fake `ActionInputExtractor`, use a fresh
+`InMemorySaver` per test graph, and make no network calls:
 
 ```powershell
 Copy-Item .env.example .env

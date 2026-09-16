@@ -97,6 +97,24 @@ Guidance for Claude Code (and any future contributor) working in this repository
   resynchronized (e.g. re-read the affected order and replace it in
   `order_context`) so state never shows stale data - and only the affected
   record changes, never an unrelated one.
+- Code before `interrupt()` must be side-effect free (no mutation, no
+  network call, no audit-log append): LangGraph re-executes an interrupted
+  node from its beginning on every resume, so anything before `interrupt()`
+  runs more than once.
+- A `Command(resume=...)` must reuse the SAME `thread_id` the interrupt was
+  raised under; the graph never generates or derives a thread_id itself -
+  the caller owns thread identity.
+- A human decision comes only from external resume input (e.g.
+  `Command(resume={"decision": ...})`), never derived from policy, intent,
+  urgency, or any model output.
+- An approval-required mutation happens only after an explicit "approved"
+  decision - never automatically, and never merely because routing reached
+  the approval branch.
+- Checkpoint persistence (workflow/graph state, e.g. `InMemorySaver`) and
+  business-data persistence (simulated store mutations, JSON fixtures) are
+  separate concerns; neither is durable across a process restart in this
+  project, and that limitation should be stated accurately, not implied to
+  be production-grade.
 
 ## Language
 
