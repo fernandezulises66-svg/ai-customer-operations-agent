@@ -67,6 +67,16 @@ Guidance for Claude Code (and any future contributor) working in this repository
 - Technical/state-corruption errors (e.g. a referenced order absent from
   the customer's own scoped context) must raise a domain exception, never
   silently resolve to a valid-looking business outcome.
+- Conditional routing must be driven by explicit structured state (e.g.
+  intent, order resolution, policy assessment), never by asking the LLM
+  which branch to take.
+- Proposing an action and executing it are separate stages. A proposed
+  action is a structured statement of intent only - never invent its
+  execution payload (e.g. a new address, refund amount, or replacement
+  item) before that data actually exists.
+- Human-approval state must never be fabricated: `requires_human_approval`
+  is a policy/action output, but a human decision (`human_decision`) must
+  never be set except by an actual future approval step.
 
 ## Language
 

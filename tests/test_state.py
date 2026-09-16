@@ -7,7 +7,9 @@ constructing state dicts that match the contract.
 """
 
 from customer_ops.state import (
+    ACTION_TYPE_VALUES,
     AuditEvent,
+    CASE_ROUTE_VALUES,
     CustomerOpsState,
     HUMAN_DECISION_VALUES,
     INTENT_VALUES,
@@ -42,8 +44,11 @@ def test_workflow_status_values_are_the_documented_set():
         "context_loaded",
         "order_resolved",
         "policy_checked",
+        "clarification_required",
+        "information_ready",
         "action_proposed",
         "awaiting_approval",
+        "blocked",
         "action_executed",
         "escalated",
         "completed",
@@ -83,6 +88,20 @@ def test_policy_code_values_are_the_documented_set():
         "PRODUCT_REVIEW_REQUIRED",
         "ORDER_REQUIRED",
         "NOT_APPLICABLE",
+    }
+
+
+def test_case_route_values_are_the_documented_set():
+    assert set(CASE_ROUTE_VALUES) == {"clarification", "information", "action", "approval", "blocked"}
+
+
+def test_action_type_values_are_the_documented_set():
+    assert set(ACTION_TYPE_VALUES) == {
+        "cancel_order",
+        "change_address",
+        "issue_refund",
+        "investigate_billing",
+        "investigate_product_issue",
     }
 
 

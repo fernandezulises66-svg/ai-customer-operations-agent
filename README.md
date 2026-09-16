@@ -1,8 +1,9 @@
 # AI Customer Operations Agent
 
 **Status: intake + classification + context loading + deterministic order
-resolution and policy evaluation (Iteration 4).** This is a portfolio
-project and is not production software.
+resolution, policy evaluation, conditional routing, and structured action
+proposals (Iteration 5).** This is a portfolio project and is not production
+software.
 
 > Mercora is a fictional e-commerce company invented for this project. All
 > customers, orders, policies, payments, addresses, and tickets referenced
@@ -36,7 +37,8 @@ observability.
 
 - **LangGraph** (`StateGraph`) orchestrates workflow state and conditional
   routing directly — no LangChain agents, `create_agent`, CrewAI, AutoGen, or
-  n8n.
+  n8n. Conditional edges (`add_conditional_edges`) dispatch on structured
+  state, not an if/else buried inside a single node.
 - The **OpenAI SDK** is called directly inside specific graph nodes that need
   LLM reasoning, using the Responses API's Structured Outputs mechanism
   rather than free-form text parsing; LangGraph orchestrates, it does not
@@ -49,70 +51,69 @@ observability.
 - The workflow state is checkpoint-friendly and produces a **structured audit
   trail** of observable events (not model reasoning).
 
-## Current implementation (Iteration 4: Order Resolution and Policy Evaluation)
+## Current implementation (Iteration 5: Conditional Routing and Action Proposal)
 
-This iteration establishes a core architecture principle, now fully in
-place: the LLM interprets intent and urgency only; everything else is
-deterministic code.
+The architecture now demonstrates the full separation of concerns the
+project exists to show:
 
-- **LLM**: intent + urgency interpretation (`customer_ops/classifier.py`).
-- **Deterministic data store**: customer/order facts
-  (`tools/customer_data.py`).
+- **LLM**: intent + urgency interpretation only (`customer_ops/classifier.py`).
+- **Deterministic data store**: customer/order facts (`tools/customer_data.py`).
 - **Deterministic resolver**: which order a request refers to
   (`customer_ops/order_resolution.py`).
 - **Deterministic policy engine**: operational eligibility
   (`customer_ops/policies.py`).
+- **Deterministic router**: which workflow branch follows from that policy
+  result (`customer_ops/routing.py`).
+- **Structured action proposals**: what a future action *would* do, not
+  execution (`customer_ops/action_proposal.py`).
 
 Implemented now:
 
-- Typed workflow state (`customer_ops/state.py`): `CustomerOpsState`,
-  `AuditEvent`, `OrderContext`, and controlled `Literal` vocabularies for
-  intent, urgency, workflow status, human decision, order-resolution status,
-  policy outcome, and policy code.
+- Typed workflow state (`customer_ops/state.py`): adds `route`, controlled
+  `CaseRoute` and `ActionType` vocabularies, and new `WorkflowStatus` values
+  (`clarification_required`, `information_ready`, `blocked`; reuses
+  `action_proposed` and `awaiting_approval`).
 - Deterministic intake validation, structured intent/urgency classification,
-  and deterministic customer/order context loading - unchanged since
-  Iterations 1-3.
-- **Deterministic order-reference resolution** (`customer_ops/order_resolution.py`,
-  `resolve_order`): decides which (if any) of the customer's own orders a
-  request refers to, using only `intent`, `customer_message`, and the
-  already customer-scoped `order_context` - never OpenAI. An order is
-  selected only when exactly one known order ID appears explicitly in the
-  message (case-insensitive, never fuzzy); zero or multiple matches yield
-  conservative `needs_clarification` rather than a guess. Never infers from
-  product names, dates, amounts, or vague references like "my latest
-  order".
-- **Explicit deterministic Mercora policy rules** (`customer_ops/policies.py`,
-  `evaluate_policy`): hand-written business rules - not a RAG system, not an
-  LLM call - covering `order_status`, `cancel_order`, `address_change`,
-  `refund_request`, `billing_issue`, `product_issue`, and `other`. Produces
-  a structured `PolicyAssessment` (`outcome`, `policy_code`,
-  `requires_human_approval`, `reason`) with stable machine-readable policy
-  codes. `requires_human_approval` is a policy *output* only - no approval
-  step exists yet, and no action is proposed or executed.
-- Conservative ambiguity handling throughout: an order that can't be
-  resolved unambiguously, or a `selected_order_id` that doesn't appear in
-  the customer's own `order_context`, is treated as a `needs_clarification`
-  business outcome or a raised domain error (`OrderResolutionError`,
-  `PolicyEvaluationError`) - never silently guessed or defaulted.
+  deterministic context loading, order resolution, and policy evaluation -
+  semantically unchanged since Iterations 1-4.
+- **A genuine LangGraph conditional edge** after `evaluate_policy`
+  (`graph.add_conditional_edges(...)`, not an if/else buried in one node):
+  routes to one of five terminal branches based only on structured state
+  (`intent`, `order_resolution`, `policy_assessment`) via
+  `determine_case_route` - never an LLM call, and never a fabricated branch
+  for inconsistent state (`RoutingError`).
+  - `needs_clarification` -> **clarification**: the order remains
+    unidentified; nothing is guessed.
+  - `information_only` (e.g. order_status) and `not_applicable` (intent
+    "other") both -> **information**: a direct, non-operational answer.
+  - `eligible` (e.g. cancel_order, address_change) -> **action**: a safe
+    action is proposed only.
+  - `review_required` (e.g. refund_request, billing_issue, product_issue)
+    -> **approval**: a sensitive action is proposed and marked as requiring
+    human approval - no interrupt or decision yet.
+  - `blocked` -> **blocked**: no action is proposed; not automatically
+    escalated.
+- **Structured `ProposedAction`** (`action_type`, `order_id`,
+  `requires_human_approval`) mapped deterministically from intent - never
+  execution, and never an invented payload (no new address, refund amount,
+  or replacement item; that is a later iteration).
 - LangGraph workflow:
-  `START -> intake -> classify_request -> load_context -> resolve_order -> evaluate_policy -> END`,
-  still linear (conditional routing is a later iteration), built via
-  `build_customer_ops_graph(classifier=None, store=None)`.
-- Observable workflow audit events for all five stages (`intake`,
-  `classification`, `context_loading`, `order_resolution`,
-  `policy_evaluation`) - the audit log records what happened, never full
+  `START -> intake -> classify_request -> load_context -> resolve_order -> evaluate_policy -> (conditional) -> {clarification, information, propose_action, prepare_approval, blocked} -> END`,
+  built via `build_customer_ops_graph(classifier=None, store=None)`.
+- Observable workflow audit events for all stages, including one
+  branch-specific event per routed case (`clarification`, `information`,
+  `action_proposal`, `approval_required`, or `blocked`) - never full
   customer/order details or model reasoning.
 - A minimal `app.py` placeholder entry point (no CLI, no OpenAI call).
 - Unit tests for state contracts, models, the data store, the classifier,
-  order resolution, policy evaluation, and graph behavior - all running
-  with no network access and no API key.
+  order resolution, policy evaluation, routing, action proposal, and full
+  graph branch coverage - all running with no network access and no API
+  key.
 
 Planned later (not implemented yet):
 
-- Conditional routing between workflow branches.
-- Action proposal.
 - Simulated mutation tools (refunds, cancellations, address changes, etc.).
-- Human-in-the-loop approval gate (interrupts).
+- Human-in-the-loop approval gate (`interrupt()` / `Command(resume=...)`).
 - Checkpointing / persistence.
 - Action execution.
 - Final customer-facing response generation.
@@ -144,6 +145,8 @@ ai-customer-operations-agent/
 │   ├── classifier.py       # ClassificationDecision, RequestClassifier, OpenAIRequestClassifier
 │   ├── order_resolution.py # OrderResolution, resolve_order() - deterministic order selection
 │   ├── policies.py         # PolicyAssessment, evaluate_policy() - deterministic Mercora rules
+│   ├── routing.py          # determine_case_route() - deterministic branch selection
+│   ├── action_proposal.py  # ProposedAction, propose_action() - structured action intent
 │   └── graph.py            # all graph nodes, build_customer_ops_graph()
 │
 ├── tools/
@@ -166,6 +169,8 @@ ai-customer-operations-agent/
 │   ├── test_classifier.py
 │   ├── test_order_resolution.py
 │   ├── test_policies.py
+│   ├── test_routing.py
+│   ├── test_action_proposal.py
 │   └── test_graph.py
 │
 ├── app.py                # minimal placeholder entry point

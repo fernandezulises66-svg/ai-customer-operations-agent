@@ -31,8 +31,11 @@ WorkflowStatus = Literal[
     "context_loaded",
     "order_resolved",
     "policy_checked",
+    "clarification_required",
+    "information_ready",
     "action_proposed",
     "awaiting_approval",
+    "blocked",
     "action_executed",
     "escalated",
     "completed",
@@ -42,6 +45,21 @@ WorkflowStatus = Literal[
 HumanDecision = Literal["approved", "rejected"]
 
 OrderResolutionStatus = Literal["selected", "not_required", "needs_clarification"]
+
+# The workflow branch chosen after policy evaluation. `information_only`
+# and `not_applicable` policy outcomes both route to "information" - see
+# customer_ops/routing.py.
+CaseRoute = Literal["clarification", "information", "action", "approval", "blocked"]
+
+# The operational action a `ProposedAction` describes. A proposal, never an
+# execution - see customer_ops/action_proposal.py.
+ActionType = Literal[
+    "cancel_order",
+    "change_address",
+    "issue_refund",
+    "investigate_billing",
+    "investigate_product_issue",
+]
 
 PolicyOutcome = Literal[
     "information_only",
@@ -78,6 +96,8 @@ HUMAN_DECISION_VALUES: tuple[str, ...] = get_args(HumanDecision)
 ORDER_RESOLUTION_STATUS_VALUES: tuple[str, ...] = get_args(OrderResolutionStatus)
 POLICY_OUTCOME_VALUES: tuple[str, ...] = get_args(PolicyOutcome)
 POLICY_CODE_VALUES: tuple[str, ...] = get_args(PolicyCode)
+CASE_ROUTE_VALUES: tuple[str, ...] = get_args(CaseRoute)
+ACTION_TYPE_VALUES: tuple[str, ...] = get_args(ActionType)
 
 
 # --- Audit trail --------------------------------------------------------------
@@ -140,7 +160,8 @@ class CustomerOpsState(TypedDict):
     # Policy evaluation
     policy_assessment: NotRequired[dict[str, Any] | None]
 
-    # Action planning (future iterations)
+    # Routing and action proposal
+    route: NotRequired[CaseRoute | None]
     proposed_action: NotRequired[dict[str, Any] | None]
 
     # Human-in-the-loop (future iterations)

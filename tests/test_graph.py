@@ -1,13 +1,14 @@
 """Tests for the Customer Operations LangGraph workflow.
 
 These tests cover our own behavior (validation, normalization, classification
-wiring, context loading, order resolution, policy evaluation, audit logging,
-workflow status) - not LangGraph internals. No test makes a network or
-OpenAI API call: `classify_request` is always exercised through
-`FakeRequestClassifier` and `load_context` through
+wiring, context loading, order resolution, policy evaluation, conditional
+routing, action proposal, audit logging, workflow status) - not LangGraph
+internals. No test makes a network or OpenAI API call: `classify_request` is
+always exercised through `FakeRequestClassifier` and `load_context` through
 `FakeCustomerOperationsStore`, both deterministic test doubles defined below.
-`resolve_order` and `evaluate_policy` are already fully deterministic and
-offline, so the real implementations are used directly.
+`resolve_order`, `evaluate_policy`, routing, and action proposal are already
+fully deterministic and offline, so the real implementations are used
+directly.
 """
 
 import json
@@ -132,16 +133,17 @@ def test_graph_builds_with_injected_classifier_and_store():
     assert graph is not None
 
 
-def test_valid_request_reaches_policy_checked_status():
+def test_valid_request_reaches_information_ready_status():
     graph = make_graph()
     result = graph.invoke(
         {
             "request_id": "req-001",
             "customer_id": "cust-001",
-            "customer_message": "Quiero saber donde esta mi pedido.",
+            "customer_message": "Quiero saber el estado de order-0001.",
         }
     )
-    assert result["workflow_status"] == "policy_checked"
+    assert result["workflow_status"] == "information_ready"
+    assert result["route"] == "information"
 
 
 def test_customer_message_is_trimmed():
@@ -261,10 +263,10 @@ def test_graph_invocation_makes_no_network_calls(no_network):
         {
             "request_id": "req-001",
             "customer_id": "cust-001",
-            "customer_message": "Where is my order?",
+            "customer_message": "What is the status of order-0001?",
         }
     )
-    assert result["workflow_status"] == "policy_checked"
+    assert result["workflow_status"] == "information_ready"
 
 
 def test_state_contains_only_json_friendly_data():
@@ -497,7 +499,8 @@ def test_customer_with_zero_orders_is_valid():
             "customer_message": "Where is my order?",
         }
     )
-    assert result["workflow_status"] == "policy_checked"
+    assert result["workflow_status"] == "clarification_required"
+    assert result["route"] == "clarification"
     assert result["order_context"] == {"orders": [], "count": 0}
     assert result["order_resolution"]["status"] == "needs_clarification"
 
@@ -605,7 +608,7 @@ def test_policy_evaluation_audit_event_appended():
     assert "information_only" in result["audit_log"][4]["message"]
 
 
-def test_exactly_five_workflow_audit_stages():
+def test_exactly_six_workflow_audit_stages():
     store = FakeCustomerOperationsStore(
         customers={"cust-777": make_customer("cust-777")},
         orders_by_customer={"cust-777": [make_order("order-aaa", "cust-777", status="shipped")]},
@@ -625,6 +628,7 @@ def test_exactly_five_workflow_audit_stages():
         "context_loading",
         "order_resolution",
         "policy_evaluation",
+        "information",
     ]
 
 
@@ -645,3 +649,168 @@ def test_customer_and_order_facts_unchanged_after_policy_evaluation():
     )
     assert result["customer_context"] == customer.model_dump(mode="json")
     assert result["order_context"] == {"orders": [order.model_dump(mode="json")], "count": 1}
+
+
+# --- conditional routing branches --------------------------------------------
+
+
+def test_clarification_branch_for_ambiguous_order_reference():
+    store = FakeCustomerOperationsStore(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={
+            "cust-777": [make_order("order-aaa", "cust-777"), make_order("order-bbb", "cust-777")]
+        },
+    )
+    classifier = FakeRequestClassifier(intent="cancel_order", urgency="medium")
+    graph = make_graph(classifier, store)
+    result = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "I want to cancel my order.",
+        }
+    )
+    assert result["route"] == "clarification"
+    assert "proposed_action" not in result
+    assert result["workflow_status"] == "clarification_required"
+    assert result["audit_log"][-1]["step"] == "clarification"
+
+
+def test_information_branch_for_order_status_with_explicit_order():
+    store = FakeCustomerOperationsStore(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={"cust-777": [make_order("order-aaa", "cust-777", status="shipped")]},
+    )
+    classifier = FakeRequestClassifier(intent="order_status", urgency="low")
+    graph = make_graph(classifier, store)
+    result = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "Where is order-aaa?",
+        }
+    )
+    assert result["route"] == "information"
+    assert "proposed_action" not in result
+    assert result["workflow_status"] == "information_ready"
+    assert result["audit_log"][-1]["step"] == "information"
+
+
+def test_action_branch_for_eligible_cancel_order():
+    order = make_order("order-aaa", "cust-777", status="pending")
+    store = FakeCustomerOperationsStore(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={"cust-777": [order]},
+    )
+    classifier = FakeRequestClassifier(intent="cancel_order", urgency="medium")
+    graph = make_graph(classifier, store)
+    result = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "Please cancel order-aaa.",
+        }
+    )
+    assert result["route"] == "action"
+    assert result["proposed_action"] == {
+        "action_type": "cancel_order",
+        "order_id": "order-aaa",
+        "requires_human_approval": False,
+    }
+    assert result["workflow_status"] == "action_proposed"
+    assert result["audit_log"][-1]["step"] == "action_proposal"
+    # The order itself was never mutated - only a proposal was recorded.
+    assert result["order_context"] == {"orders": [order.model_dump(mode="json")], "count": 1}
+
+
+def test_approval_branch_for_refund_on_delivered_paid_order():
+    order = make_order("order-aaa", "cust-777", status="delivered", payment_status="paid")
+    store = FakeCustomerOperationsStore(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={"cust-777": [order]},
+    )
+    classifier = FakeRequestClassifier(intent="refund_request", urgency="high")
+    graph = make_graph(classifier, store)
+    result = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "I would like a refund for order-aaa.",
+        }
+    )
+    assert result["route"] == "approval"
+    assert result["proposed_action"] == {
+        "action_type": "issue_refund",
+        "order_id": "order-aaa",
+        "requires_human_approval": True,
+    }
+    assert result["workflow_status"] == "awaiting_approval"
+    assert result["audit_log"][-1]["step"] == "approval_required"
+    assert "human_decision" not in result
+    assert "action_result" not in result
+
+
+def test_blocked_branch_for_address_change_on_shipped_order():
+    order = make_order("order-aaa", "cust-777", status="shipped")
+    store = FakeCustomerOperationsStore(
+        customers={"cust-777": make_customer("cust-777")},
+        orders_by_customer={"cust-777": [order]},
+    )
+    classifier = FakeRequestClassifier(intent="address_change", urgency="medium")
+    graph = make_graph(classifier, store)
+    result = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "Please change the address on order-aaa.",
+        }
+    )
+    assert result["route"] == "blocked"
+    assert "proposed_action" not in result
+    assert result["workflow_status"] == "blocked"
+    assert result["audit_log"][-1]["step"] == "blocked"
+
+
+def test_information_branch_for_other_intent():
+    store = FakeCustomerOperationsStore(customers={"cust-777": make_customer("cust-777")})
+    classifier = FakeRequestClassifier(intent="other", urgency="low")
+    graph = make_graph(classifier, store)
+    result = graph.invoke(
+        {
+            "request_id": "req-001",
+            "customer_id": "cust-777",
+            "customer_message": "Do you sell gift cards?",
+        }
+    )
+    assert result["route"] == "information"
+    assert "proposed_action" not in result
+    assert result["workflow_status"] == "information_ready"
+    assert result["audit_log"][-1]["step"] == "information"
+
+
+@pytest.mark.parametrize(
+    "intent,order_status,payment_status,message",
+    [
+        ("cancel_order", "processing", "paid", "Please cancel order-aaa."),
+        ("address_change", "shipped", "paid", "Please change the address on order-aaa."),
+        ("refund_request", "delivered", "paid", "I would like a refund for order-aaa."),
+        ("order_status", "shipped", "paid", "Where is order-aaa?"),
+    ],
+)
+def test_routed_results_are_json_serializable_and_deterministic(
+    intent, order_status, payment_status, message
+):
+    def build_graph():
+        order = make_order("order-aaa", "cust-777", status=order_status, payment_status=payment_status)
+        store = FakeCustomerOperationsStore(
+            customers={"cust-777": make_customer("cust-777")},
+            orders_by_customer={"cust-777": [order]},
+        )
+        classifier = FakeRequestClassifier(intent=intent, urgency="medium")
+        return make_graph(classifier, store)
+
+    payload = {"request_id": "req-001", "customer_id": "cust-777", "customer_message": message}
+    result_a = build_graph().invoke(dict(payload))
+    result_b = build_graph().invoke(dict(payload))
+    json.dumps(result_a)  # raises TypeError if anything is not JSON-serializable
+    assert result_a == result_b
