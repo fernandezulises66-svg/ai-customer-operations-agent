@@ -206,6 +206,37 @@ def test_english_customer_message_preserved():
     assert context.customer_message == "Where is my order order-1001?"
 
 
+# --- Language instruction contract (prompt text only - not proof of model behavior) --
+#
+# These tests only verify that the durable instruction text sent to the model
+# states the language rule as a hard constraint and is passed through
+# unmodified. They cannot verify that the model actually complies - that can
+# only be checked by the real benchmark (`python -m evals.run_e2e_evals`).
+
+
+def test_language_instructions_require_english_for_english_messages():
+    instructions = response_generator_module.RESPONSE_GENERATION_INSTRUCTIONS
+    assert "hard constraint" in instructions
+    assert "clearly written in English" in instructions
+    assert "ENTIRE response" in instructions
+    assert "must be written in English" in instructions
+
+
+def test_language_instructions_forbid_defaulting_to_spanish_for_english_input():
+    instructions = response_generator_module.RESPONSE_GENERATION_INSTRUCTIONS
+    assert "do not default to Spanish" in instructions
+    assert "mix" in instructions.lower()
+
+
+def test_instructions_sent_to_model_are_the_module_constant():
+    client = FakeOpenAIClient(parsed=CustomerResponse(message="Hola"))
+    generator = OpenAICustomerResponseGenerator(client=client, model="gpt-test")
+
+    generator.generate(build_response_context("Hola"))
+
+    assert client.responses.calls[0]["instructions"] == response_generator_module.RESPONSE_GENERATION_INSTRUCTIONS
+
+
 # --- No hidden reasoning fields -----------------------------------------------------
 
 
