@@ -5,24 +5,25 @@ manually after deployment (or from a local `streamlit run streamlit_app.py`
 session). No screenshot here is synthetic or generated - each one must come
 from the actual app.
 
-## Planned screenshots
+## Current screenshots
+
+All four planned screenshots have been captured from the public deployed
+app and are embedded in the main `README.md`'s "Demo Screenshots" section:
 
 1. **`information-response.png`** - a completed order-status flow: a
    synthetic customer's order-status question, answered directly with no
    approval interrupt, showing the grounded final response.
 
-2. **`approval-pending.png`** - a sensitive action (refund, billing
-   investigation, or product investigation) paused at the human-approval
-   card. Must show the pending-approval UI with **no final response yet**
-   and no mutation applied.
+2. **`approval-pending.png`** - a sensitive action (refund) paused at the
+   human-approval card, with **no final response yet** and no mutation
+   applied.
 
 3. **`approval-completed.png`** - the same case immediately after clicking
    **Aprobar**, showing the resumed workflow's completed final response.
 
-4. **`workflow-details.png`** - the "Detalles del workflow" and/or
-   "Registro de auditoría" expanders open, showing the structured
-   observability fields (intent, route, policy outcome, workflow status,
-   audit steps).
+4. **`workflow-details.png`** - the "Detalles del workflow" expander open,
+   showing the structured observability fields (intent, route, policy
+   outcome, workflow status, and more).
 
 ## Rules for any screenshot added here
 
@@ -35,7 +36,7 @@ from the actual app.
 
 ## Status
 
-No screenshots have been added yet. `README.md` intentionally does not
-reference images from this directory until real screenshots exist here -
-add the `![...](docs/screenshots/...)` references in a small follow-up
-once they do, so the main README never links a missing image.
+All four screenshots above exist and are referenced from the main
+`README.md`. If a screenshot is ever replaced (e.g. after a UI change),
+re-capture it from the real running app and re-check it against the rules
+above before committing - never restore a placeholder or generated image.

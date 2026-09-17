@@ -27,6 +27,17 @@ responses, safe mutations, human-in-the-loop approval and rejection, blocked
 paths, and New Case isolation all behaved as designed. This is a functional
 check, not a quantitative production-quality claim.
 
+## Demo Screenshots
+
+Real screenshots from the deployed app (see `docs/screenshots/`):
+
+| | |
+| --- | --- |
+| ![Completed order-status case with a grounded final response](docs/screenshots/information-response.png) | ![Human-approval card pending for a simulated refund](docs/screenshots/approval-pending.png) |
+| Order-status case, completed with no approval needed | Refund case paused at the human-approval card |
+| ![Same refund case after Aprobar, showing the completed final response](docs/screenshots/approval-completed.png) | ![Workflow details expander showing structured, PII-free state](docs/screenshots/workflow-details.png) |
+| Same case immediately after **Aprobar** - resumed and completed | "Detalles del workflow" expander for the approved case |
+
 ## Why This Project
 
 Customer operations requests mix two very different kinds of problems: understanding
