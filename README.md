@@ -14,8 +14,18 @@ project, not production software.
 
 ## Live Demo
 
-Public Streamlit demo: deployment pending. (This line will be replaced with
-a real URL after manual deployment to Streamlit Community Cloud.)
+Public Streamlit demo:
+[https://ai-customer-operations-agent-vs4yvseepssw2pvemitjhx.streamlit.app/](https://ai-customer-operations-agent-vs4yvseepssw2pvemitjhx.streamlit.app/)
+
+- Mercora is a fictional company; all customer/order data is synthetic.
+- Every operational action (cancellation, address change, refund,
+  investigation) is simulated.
+- Running a case makes real OpenAI API calls.
+
+This public deployment has been manually smoke-tested end to end: information
+responses, safe mutations, human-in-the-loop approval and rejection, blocked
+paths, and New Case isolation all behaved as designed. This is a functional
+check, not a quantitative production-quality claim.
 
 ## Why This Project
 

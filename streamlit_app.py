@@ -91,16 +91,16 @@ def _format_customer(customer_id: str) -> str:
 
 _EXAMPLE_SCENARIOS: tuple[tuple[str, str, str], ...] = (
     ("Consulta de estado de pedido", "cust-001", "Hola, ¿dónde está mi pedido order-1001?"),
-    ("Cancelación segura (pedido pendiente)", "cust-002", "Please cancel order-1005."),
+    ("Cancelación segura (pedido pendiente)", "cust-002", "Por favor cancela mi pedido order-1005."),
     (
         "Cambio de dirección con dirección nueva",
         "cust-006",
         "Por favor cambia la direccion de envio de order-1010 a Avenida Central 456, Cordoba, Argentina.",
     ),
-    ("Reembolso (requiere aprobación humana)", "cust-001", "I would like a refund for order-1002."),
+    ("Reembolso (requiere aprobación humana)", "cust-001", "Quiero un reembolso para mi pedido order-1002."),
     ("Problema de facturación (requiere aprobación humana)", "cust-002", "Me cobraron dos veces por order-1004."),
     ("Problema de producto (requiere aprobación humana)", "cust-003", "El producto de order-1006 llego danado."),
-    ("Cancelación bloqueada (pedido ya enviado)", "cust-001", "Please cancel order-1001."),
+    ("Cancelación bloqueada (pedido ya enviado)", "cust-001", "Por favor cancela mi pedido order-1001."),
 )
 
 
