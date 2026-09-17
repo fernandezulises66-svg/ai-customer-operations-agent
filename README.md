@@ -3,9 +3,9 @@
 **Status: intake + classification + context loading + deterministic order
 resolution, policy evaluation, conditional routing, structured action
 proposals, simulated safe-action execution, human-in-the-loop approval with
-LangGraph checkpointing, and final customer-facing response generation
-(Iteration 8).** This is a portfolio project and is not production
-software.
+LangGraph checkpointing, final customer-facing response generation, and a
+curated end-to-end evaluation benchmark (Iteration 9).** This is a
+portfolio project and is not production software.
 
 > Mercora is a fictional e-commerce company invented for this project. All
 > customers, orders, policies, payments, addresses, and tickets referenced
@@ -143,11 +143,75 @@ business storage.
 
 Planned later (not implemented yet):
 
-- Evaluation harness (`evals/`).
 - Streamlit UI.
 - Deployment.
 - Durable checkpoint/business-data persistence (a future improvement beyond
   `InMemorySaver`).
+
+## End-to-End Evaluation
+
+`evals/` contains a curated, rule-based end-to-end evaluation benchmark that
+measures the workflow implemented above - it does not add any new business
+logic, routes, or action types, and production behavior was not changed to
+make it pass.
+
+- **`evals/e2e_cases.py`**: `EndToEndEvalCase`, a declarative Pydantic
+  contract (no callback functions) with every `expected_*` field optional,
+  and `E2E_CASES`, 20 curated cases grounded strictly in the real
+  `data/customers.json`/`data/orders.json` fixtures (real customer IDs, real
+  order IDs, real order/payment statuses - never assumed). Coverage
+  includes every intent, both Spanish and English, every routing branch
+  (information, clarification, action, approval, blocked), a zero-order
+  customer, an unknown/non-owned order reference, an already-refunded
+  order, missing-address clarification, safe mutations (cancel, address
+  change), sensitive mutations gated by human approval (refund, billing
+  investigation, product investigation) with both an approved and a
+  rejected case each, and an unsupported ("other") request.
+- **`evals/e2e_checks.py`**: ten transparent, rule-based check functions
+  (intent, urgency, order resolution, policy, route, proposed action,
+  approval behavior, mutation, final state, response). Response checks use
+  only deterministic normalized-text comparisons
+  (`normalize_text`/`contains_required_fact_groups`/
+  `contains_forbidden_facts`) - **this benchmark never uses an LLM as a
+  judge**. These checks are transparent but cannot catch every possible
+  hallucination; they only verify the specific facts a case declares.
+  Every check reports both `applicable` (whether this case exercises that
+  dimension) and `passed` (always the genuine correctness verdict for this
+  case) - per-metric accuracy is applicability-aware (cases that don't
+  exercise a dimension are excluded from that metric's denominator, never
+  counted as a pass), while a case's overall pass/fail always reflects
+  every check, applicable or not.
+- **`evals/e2e_runner.py`**: runs each case against a **completely fresh**
+  graph, `InMemorySaver`, and `InMemoryCustomerActionStore` - no mutation or
+  state from one case is ever visible to another, and case order never
+  affects results. Approval-designed cases genuinely trigger a real
+  LangGraph `interrupt()` and resume via `Command(resume={"decision":
+  ...})` on the same deterministic `eval-<case_id>` thread ID - the human
+  approval gate is never bypassed. A per-case failure (a mismatch against
+  expectations, or an unexpected exception) is captured and does not abort
+  the rest of the benchmark run.
+- **`evals/run_e2e_evals.py`**: the CLI entry point,
+  `python -m evals.run_e2e_evals`. **This command makes real OpenAI API
+  calls** (the real classifier, address extractor, and response generator)
+  for all 20 cases and **consumes real API usage/cost**. It is never run by
+  pytest and must be run manually, after reviewing the code. Because three
+  of the ten workflow components are model-backed, results can vary
+  slightly between runs; every other component (policy, routing, order
+  resolution, action execution, approval enforcement) is fully
+  deterministic and does not vary. Prints a `[PASS]`/`[FAIL]` line per case
+  plus a summary with ten applicability-aware accuracy metrics and an
+  overall pass rate, ending with a disclaimer that these metrics describe
+  only this curated benchmark, not general model accuracy or production
+  reliability.
+- **No benchmark results are published in this README yet** - the real
+  benchmark (`python -m evals.run_e2e_evals`) has not been run as part of
+  this iteration, only validated offline against fake dependencies.
+
+`tests/test_e2e_evals.py` tests this framework's own logic - fully
+offline, using synthetic cases and fake classifier/extractor/response-
+generator dependencies (never the real 20-case benchmark, never a real
+OpenAI call). See [Tests](#tests) below for how to run the full pytest
+suite, which remains 100% offline.
 
 ## Tech stack
 
@@ -193,7 +257,11 @@ ai-customer-operations-agent/
 │   └── orders.json         # synthetic Mercora orders
 │
 ├── evals/
-│   └── __init__.py      # empty in Iteration 1
+│   ├── __init__.py
+│   ├── e2e_cases.py     # EndToEndEvalCase, E2E_CASES (the 20-case benchmark)
+│   ├── e2e_checks.py    # rule-based ComponentCheckResult check functions
+│   ├── e2e_runner.py    # run_single_case()/run_e2e_evals() - fresh graph per case
+│   └── run_e2e_evals.py # CLI: python -m evals.run_e2e_evals (real OpenAI calls)
 │
 ├── tests/
 │   ├── __init__.py
@@ -211,7 +279,8 @@ ai-customer-operations-agent/
 │   ├── test_action_executor.py
 │   ├── test_approval.py
 │   ├── test_response_generator.py
-│   └── test_graph.py
+│   ├── test_graph.py
+│   └── test_e2e_evals.py
 │
 ├── app.py                # minimal placeholder entry point
 ├── CLAUDE.md
@@ -252,3 +321,17 @@ Copy-Item .env.example .env
 ```powershell
 .\.venv\Scripts\python -m pytest -q
 ```
+
+This always runs fully offline - no `OPENAI_API_KEY` needed, no network
+calls made, including for `tests/test_e2e_evals.py`.
+
+## Running the real end-to-end benchmark (optional, costs real API usage)
+
+```powershell
+.\.venv\Scripts\python -m evals.run_e2e_evals
+```
+
+This is separate from `pytest` and is never run automatically. It requires
+a valid `OPENAI_API_KEY` in `.env` and makes real OpenAI API calls for all
+20 cases in the benchmark. See [End-to-End Evaluation](#end-to-end-evaluation)
+above for what it checks and why no results are published here yet.

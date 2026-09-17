@@ -146,6 +146,25 @@ Guidance for Claude Code (and any future contributor) working in this repository
 - External/model failures must eventually be handled explicitly (no silent
   swallowing of errors).
 
+## Evaluation
+
+- Evaluation/benchmark code (`evals/`) must never leak into or special-case
+  production workflow code (`customer_ops/`, `tools/`) - a benchmark
+  measures the system as built, it never customizes the system to pass.
+- A benchmark accuracy metric's denominator must exclude cases that don't
+  exercise that dimension ("applicability-aware"); a not-applicable case is
+  never counted as a pass merely to inflate a rate.
+- Benchmark metrics describe only the curated benchmark population, not
+  general model accuracy or production reliability - state that
+  explicitly wherever benchmark results are reported.
+- Prefer deterministic, rule-based evaluation (e.g. normalized text/fact
+  checks) over LLM-as-a-judge for reproducibility and transparency; if used,
+  its detection limits must be documented, not overstated.
+- pytest for an evaluation framework must stay fully offline (fake
+  dependencies), even when that framework also supports a real,
+  model-backed run - that real run belongs in a separate, explicitly manual
+  entry point (e.g. a `python -m` CLI), never invoked by pytest.
+
 ## Scope control
 
 - Implement only the requirements of the current iteration.
