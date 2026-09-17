@@ -1,353 +1,254 @@
 # AI Customer Operations Agent
 
-**Status: intake + classification + context loading + deterministic order
-resolution, policy evaluation, conditional routing, structured action
-proposals, simulated safe-action execution, human-in-the-loop approval with
-LangGraph checkpointing, final customer-facing response generation, a
-curated end-to-end evaluation benchmark, and a Streamlit human-in-the-loop
-demo (Iteration 10).** This is a portfolio project and is not production
-software.
+A stateful customer-operations agent built on **LangGraph**: it classifies a
+customer request, resolves it against real order data, applies deterministic
+business policy, executes safe actions automatically, and pauses for
+**human approval** before anything sensitive - all with a grounded final
+response and a curated end-to-end evaluation suite. This is a portfolio
+project, not production software.
 
 > Mercora is a fictional e-commerce company invented for this project. All
 > customers, orders, policies, payments, addresses, and tickets referenced
 > anywhere in this repository are synthetic and do not represent any real
 > business or individual. All data in `data/` is fabricated for this project.
 
-## Long-term goal
+## Live Demo
 
-Build a portfolio-grade customer operations agent that receives a customer
-request and orchestrates a multi-step workflow able to:
+Public Streamlit demo: deployment pending. (This line will be replaced with
+a real URL after manual deployment to Streamlit Community Cloud.)
 
-- classify the request (intent + urgency)
-- retrieve customer information
-- retrieve order information
-- evaluate company policies
-- decide whether the case can be answered directly
-- propose operational actions
-- execute safe, simulated actions
-- pause for human approval before sensitive actions
-- escalate cases when necessary
-- generate a final customer-facing response
-- expose a structured audit trail of the workflow
+## Why This Project
 
-The project is intentionally distinct from an SQL data agent or a RAG
-knowledge assistant. Its purpose is to demonstrate: LangGraph, stateful
-workflows, conditional routing, tool usage, structured LLM outputs,
-human-in-the-loop, checkpointing, safe action execution, evaluation, and
-observability.
+Customer operations requests mix two very different kinds of problems: understanding
+what the customer actually wants (a language problem) and deciding what is
+*allowed to happen* (an operational, policy-governed problem). This project
+is a portfolio-scale demonstration of keeping those cleanly separated:
 
-## Planned architecture
+- interpreting a free-text request needs language understanding
+- resolving it against real customer/order data needs deterministic lookups
+- deciding whether an action is eligible needs deterministic policy, not a
+  model's best guess
+- sensitive operations need an explicit, auditable human approval step
+- the whole thing needs to be stateful, resumable, and observable, not a
+  single stateless prompt call
 
-- **LangGraph** (`StateGraph`) orchestrates workflow state and conditional
-  routing directly — no LangChain agents, `create_agent`, CrewAI, AutoGen, or
-  n8n. Conditional edges (`add_conditional_edges`) dispatch on structured
-  state, not an if/else buried inside a single node.
-- The **OpenAI SDK** is called directly inside specific graph nodes that need
-  LLM reasoning, using the Responses API's Structured Outputs mechanism
-  rather than free-form text parsing; LangGraph orchestrates, it does not
-  hide business logic. The LLM's responsibilities are deliberately narrow:
-  classify intent/urgency, extract an explicit replacement address when
-  needed, and phrase the final customer response - it never decides policy,
-  routing, order selection, approval, or execution results; those are
-  computed deterministically first and only handed to the model as already-
-  validated facts to communicate.
-- **Tools** (`tools/`) are narrow, independently testable interfaces used by
-  graph nodes - the read-only `CustomerOperationsStore` and the mutating
-  `CustomerActionStore`, kept as separate interfaces even where one class
-  implements both.
-- Sensitive/high-impact simulated actions require a **human-in-the-loop**
-  approval step before execution: a real LangGraph `interrupt()` pauses the
-  graph, and execution resumes only via `Command(resume=...)` carrying an
-  explicit approved/rejected decision.
-- The workflow state is checkpoint-friendly and produces a **structured audit
-  trail** of observable events (not model reasoning).
+## Architecture
 
-## Current implementation (Iteration 8: Customer Response Generation)
+```mermaid
+flowchart TD
+    A[Customer Request] --> B[Intake]
+    B --> C["Structured Classification (OpenAI)"]
+    C --> D[Context Loading]
+    D --> E[Order Resolution]
+    E --> F[Policy Evaluation]
+    F --> G{Conditional Routing}
 
-Every completed (or paused) case now ends with a safe, customer-facing
-response, grounded only in validated workflow state - completing the full
-pipeline:
+    G -->|information| H[Information]
+    G -->|clarification| I[Clarification]
+    G -->|blocked| J[Blocked]
+    G -->|safe action| K[Safe Action Execution]
+    G -->|approval required| L[Human Approval]
 
-**Policy** (what is allowed) **-> Routing** (which workflow path follows)
-**-> Proposed Action** (what operation is intended) **-> Action Input**
-(what validated parameters it needs) **-> `interrupt()`** (sensitive actions
-only - pause and wait for a human) **-> Executor** (calls exactly one store
-method, only after approval) **-> Simulated Store** (the in-memory mutation)
-**-> Final Response** (phrase the outcome - never decide it).
+    L --> M["interrupt()"]
+    M --> N[Reviewer Decision]
+    N -->|approved - same thread_id| O["Resume: Execute Action"]
+    N -->|rejected - same thread_id| P["Resume: No Mutation"]
 
-This separation is the project's core architecture point:
+    H --> Q["Grounded Customer Response (OpenAI)"]
+    I --> Q
+    J --> Q
+    K --> Q
+    O --> Q
+    P --> Q
+    Q --> R[END]
+```
 
-- **LLM responsibilities**: classify intent/urgency; extract an explicit
-  replacement address only when `change_address` needs one; phrase the
-  final customer-facing response (`customer_ops/classifier.py`,
-  `customer_ops/action_inputs.py`, `customer_ops/response_generator.py`).
-- **Deterministic responsibilities**: customer/order facts, order
-  resolution, policy, routing, action-proposal mapping, action execution,
-  and approval enforcement (everything else in `customer_ops/`). The model
-  never decides any of these - they already exist as structured state by
-  the time the response generator runs.
+LangGraph (`StateGraph`) owns the state and the routing - conditional edges
+dispatch on structured state (intent, order resolution, policy assessment),
+never on asking a model which branch to take. See `customer_ops/graph.py`
+for the exact node-by-node implementation.
 
-Implemented now:
+## LLM vs Deterministic Responsibilities
 
-- **`customer_ops/response_generator.py`**: `CustomerResponse` (`message`
-  only - no reasoning, rationale, confidence, or citations) and
-  `ResponseContext`, a narrow, JSON-friendly, PII-free subset of state
-  (`customer_message`, `intent`, `route`, `workflow_status`,
-  `selected_order_id`, `order_summary` - order ID/status/tracking number
-  only, `policy_outcome`/`policy_code`/`policy_reason`, `proposed_action`,
-  `action_input`, `human_decision`, `action_result`). Never the full
-  `customer_context`/`order_context`, never `audit_log`, never checkpointer
-  data. `build_response_context(...)` takes only already-extracted
-  primitives (e.g. a single already-selected order, never the full order
-  list), so unrelated data structurally cannot leak in.
-- **`OpenAICustomerResponseGenerator`**: one OpenAI Responses API
-  Structured Outputs call per response, mirroring
-  `OpenAIRequestClassifier`/`OpenAIActionInputExtractor`. Instructed to use
-  ONLY the supplied context - never invent dates, amounts, addresses,
-  shipping estimates, compensation, policies, or support promises; never
-  claim an action succeeded unless `action_result.success` is true; never
-  claim a sensitive action happened unless `human_decision == "approved"`;
-  never mention LangGraph/OpenAI/internal architecture or expose raw
-  policy codes.
-- **Language**: Spanish-first; replies in English only when the customer's
-  own message is clearly English. Order IDs and action names are never
-  translated. No language selector.
-- **`final_response` node**: reached by every terminal branch
-  (clarification, information, blocked, safe execution, approved execution,
-  rejected). Builds the `ResponseContext`, calls
-  `generator.generate(...)` exactly once, stores only the resulting message
-  text in `final_response` (never the full `CustomerResponse` object), sets
-  `workflow_status = "completed"`, and appends one generic audit event -
-  the response text itself is never duplicated into `audit_log`.
-- **HITL ordering preserved**: an approval-required case still pauses at
-  `interrupt()` before ever reaching `final_response` - proven by tests
-  showing the response generator is called zero times on the interrupted
-  pass and exactly once total after resume, never twice.
-- LangGraph workflow:
-  `START -> intake -> classify_request -> load_context -> resolve_order -> evaluate_policy -> (conditional) -> {clarification, information, propose_action -> prepare_action_input -> (conditional) -> {execute_safe_action, clarification}, prepare_approval -> prepare_approval_input -> human_approval -- interrupt() -- (resume) --> {execute_approved_action, approval_rejected}, blocked} -> final_response -> END`,
-  built via `build_customer_ops_graph(classifier=None, store=None, action_input_extractor=None, action_store=None, checkpointer=None, response_generator=None)`.
-- A minimal `app.py` placeholder entry point (no CLI, no OpenAI call).
-- Unit tests for state contracts, models, the data store, the classifier,
-  order resolution, policy evaluation, routing, action proposal, action
-  inputs, the action store, the action executor, approval contracts, the
-  response generator, and full graph branch/HITL/response coverage - all
-  running with no network access and no API key.
+This split is the project's central architecture decision:
 
-**Important limitations, stated accurately**: `InMemorySaver` checkpoint
-state survives separate invoke/resume calls only while this Python process
-and this saver instance stay alive - it provides **no durable persistence
-across a process restart**, and it is a different concern entirely from the
-simulated business-data mutations in `tools/action_store.py` (also
-process-local). No real money, orders, or customer systems are ever
-touched. The JSON fixtures remain example source data, not persistent
-business storage.
+**LLM-backed** (`customer_ops/classifier.py`, `action_inputs.py`,
+`response_generator.py`):
+- intent/urgency classification
+- extracting an explicit replacement shipping address, only when needed,
+  and only ever what the customer actually typed - never invented
+- phrasing the final customer-facing response
 
-Planned later (not implemented yet):
+**Deterministic** (everything else in `customer_ops/`):
+- operational facts (customer/order data)
+- order resolution (which order a request refers to - never guessed)
+- policy evaluation (is this action eligible, blocked, or does it need
+  review)
+- routing (which workflow branch runs next)
+- action-type mapping and validated execution inputs
+- the simulated mutation itself
+- human-approval enforcement
 
-- Deployment.
-- Durable checkpoint/business-data persistence (a future improvement beyond
-  `InMemorySaver`).
+The model never decides policy, routing, order selection, approval, or
+execution outcomes. Those are computed first, as structured state, and only
+handed to the model afterward - to classify or to phrase, never to decide.
 
-## End-to-End Evaluation
+## Human-in-the-Loop
 
-`evals/` contains a curated, rule-based end-to-end evaluation benchmark that
-measures the workflow implemented above - it does not add any new business
-logic, routes, or action types, and production behavior was not changed to
-make it pass.
+Sensitive actions (refund, billing investigation, product investigation)
+pause at a real LangGraph `interrupt()` - not a simulated pause, an actual
+graph suspension backed by `InMemorySaver` checkpointing. The caller owns
+`thread_id` (the graph never generates one); resuming with
+`Command(resume={"decision": "approved" | "rejected"})` on that **same**
+`thread_id` is the only way execution continues. No mutation, network call,
+or audit-log write happens before the interrupt fires, since LangGraph
+re-runs an interrupted node from its start on every resume. An "approved"
+decision executes the action exactly once; "rejected" performs no mutation
+at all. Checkpoint state is process/session-local (see
+[Limitations](#limitations)) - this is a demo mechanism, not a durable queue.
 
-- **`evals/e2e_cases.py`**: `EndToEndEvalCase`, a declarative Pydantic
-  contract (no callback functions) with every `expected_*` field optional,
-  and `E2E_CASES`, 20 curated cases grounded strictly in the real
-  `data/customers.json`/`data/orders.json` fixtures (real customer IDs, real
-  order IDs, real order/payment statuses - never assumed). Coverage
-  includes every intent, both Spanish and English, every routing branch
-  (information, clarification, action, approval, blocked), a zero-order
-  customer, an unknown/non-owned order reference, an already-refunded
-  order, missing-address clarification, safe mutations (cancel, address
-  change), sensitive mutations gated by human approval (refund, billing
-  investigation, product investigation) with both an approved and a
-  rejected case each, and an unsupported ("other") request.
-- **`evals/e2e_checks.py`**: ten transparent, rule-based check functions
-  (intent, urgency, order resolution, policy, route, proposed action,
-  approval behavior, mutation, final state, response). Response checks use
-  only deterministic normalized-text comparisons
-  (`normalize_text`/`contains_required_fact_groups`/
-  `contains_forbidden_facts`) - **this benchmark never uses an LLM as a
-  judge**. These checks are transparent but cannot catch every possible
-  hallucination; they only verify the specific facts a case declares.
-  Every check reports both `applicable` (whether this case exercises that
-  dimension) and `passed` (always the genuine correctness verdict for this
-  case) - per-metric accuracy is applicability-aware (cases that don't
-  exercise a dimension are excluded from that metric's denominator, never
-  counted as a pass), while a case's overall pass/fail always reflects
-  every check, applicable or not.
-- **`evals/e2e_runner.py`**: runs each case against a **completely fresh**
-  graph, `InMemorySaver`, and `InMemoryCustomerActionStore` - no mutation or
-  state from one case is ever visible to another, and case order never
-  affects results. Approval-designed cases genuinely trigger a real
-  LangGraph `interrupt()` and resume via `Command(resume={"decision":
-  ...})` on the same deterministic `eval-<case_id>` thread ID - the human
-  approval gate is never bypassed. A per-case failure (a mismatch against
-  expectations, or an unexpected exception) is captured and does not abort
-  the rest of the benchmark run.
-- **`evals/run_e2e_evals.py`**: the CLI entry point,
-  `python -m evals.run_e2e_evals`. **This command makes real OpenAI API
-  calls** (the real classifier, address extractor, and response generator)
-  for all 20 cases and **consumes real API usage/cost**. It is never run by
-  pytest and must be run manually, after reviewing the code. Because three
-  of the ten workflow components are model-backed, results can vary
-  slightly between runs; every other component (policy, routing, order
-  resolution, action execution, approval enforcement) is fully
-  deterministic and does not vary. Prints a `[PASS]`/`[FAIL]` line per case
-  plus a summary with ten applicability-aware accuracy metrics and an
-  overall pass rate, ending with a disclaimer that these metrics describe
-  only this curated benchmark, not general model accuracy or production
-  reliability.
-- **Latest reviewed real-benchmark result** (`python -m evals.run_e2e_evals`,
-  run manually and reviewed, not run by pytest or by this iteration):
-  20 cases, 20/20 passed, all structured workflow metrics at 100%, response
-  fact-check at 100%. **These results apply only to this curated benchmark
-  and are not claims of general model accuracy or production reliability.**
-  Results can vary across runs, since three of the ten workflow components
-  are model-backed - see `evals/run_e2e_evals.py` for the same disclaimer
-  printed after every run.
+## Safety / Guardrails
 
-`tests/test_e2e_evals.py` tests this framework's own logic - fully
-offline, using synthetic cases and fake classifier/extractor/response-
-generator dependencies (never the real 20-case benchmark, never a real
-OpenAI call). See [Tests](#tests) below for how to run the full pytest
-suite, which remains 100% offline.
+- A deterministic policy layer decides eligibility - never LLM improvisation.
+- Sensitive actions require an explicit human-approval gate, enforced again
+  at the executor boundary itself (defense in depth).
+- Every executed action uses an explicit, validated input model - never a
+  raw or arbitrary payload.
+- A missing required input (e.g. no replacement address) is never invented
+  or guessed - it becomes an explicit clarification request.
+- All mutations are simulated and in-memory only; nothing is ever written to
+  the JSON fixtures or a real external system.
+- The final response is grounded in a narrow, PII-free context - never the
+  full graph state, never invented facts.
+- The human-approval payload exposes only the minimum needed to decide
+  (action, order, amount, currency, message) - never customer email,
+  address, or full state.
+- The audit log records observable events only - never model reasoning,
+  never full customer/order details, never the response text itself.
+- The Streamlit UI never renders a raw exception - only a small set of
+  allowlisted, generic error messages, chosen by exception type.
+
+This is a safety-*oriented* design for a portfolio demo, not a claim of
+production-grade security.
+
+## Evaluation
+
+`evals/` is a curated, rule-based end-to-end benchmark over the real
+workflow - deterministic fact/string checks only, **never an LLM-as-a-judge**.
+Latest reviewed real run (`python -m evals.run_e2e_evals`, executed and
+reviewed manually, never by pytest):
+
+| Dimension | Result |
+| --- | --- |
+| Intent | 20/20 |
+| Urgency | 20/20 |
+| Order resolution | 20/20 |
+| Policy | 20/20 |
+| Routing | 20/20 |
+| Action proposal | 11/11 applicable |
+| Approval behavior | 7/7 applicable |
+| Mutation behavior | 20/20 |
+| Final state | 20/20 |
+| Response fact-check | 20/20 |
+| **Overall** | **20/20** |
+
+**These metrics apply only to this curated benchmark and are not claims of
+general model accuracy or production reliability.** The 20 cases are
+grounded in the real synthetic fixtures and cover every intent, both
+Spanish and English, every routing branch, and both approval decisions - they
+are not a statistically representative sample of anything beyond themselves.
+
+- The real benchmark makes real OpenAI API calls and costs real usage;
+  three of its ten checked dimensions are model-backed, so results can vary
+  slightly between runs. Every other dimension (policy, routing, order
+  resolution, mutation, approval enforcement) is fully deterministic.
+- Response checks are transparent, deterministic fact/string comparisons -
+  never an LLM judging another model's output.
+- `pytest` (`tests/test_e2e_evals.py`) tests only this framework's own
+  logic, fully offline, with synthetic cases and fake dependencies - it
+  never runs the real 20-case benchmark and never calls OpenAI.
 
 ## Streamlit Demo
 
-`streamlit_app.py` is a portfolio-facing, Spanish-first UI around the exact
-workflow described above - it adds no new business logic, and does not
-change policy/routing/action-execution behavior.
+`streamlit_app.py` is a Spanish-first UI around the exact same production
+workflow above - no new business logic, no changed policy/routing/execution
+behavior. It renders the initial page with zero OpenAI calls; a real call
+only happens once a case is actually submitted.
 
-```powershell
-.\.venv\Scripts\streamlit run streamlit_app.py
-```
+- pick a synthetic customer, type (or load an example) a request, and run it
+  through a form - nothing runs on every keystroke;
+- safe actions execute directly and show the graph-produced `final_response`
+  verbatim - the UI never regenerates or edits it;
+- sensitive actions pause at the real `interrupt()`, showing only the
+  public approval fields, with **Aprobar**/**Rechazar** buttons that resume
+  the same `thread_id` - execution happens exactly once, only after an
+  explicit "approved" decision;
+- a "Detalles del workflow" expander and a "Registro de auditoría" expander
+  expose the same structured, PII-free state described above;
+- **Nuevo caso** discards the active runtime and starts the next case from a
+  completely fresh simulated store/checkpointer.
 
-Loading the page never calls OpenAI or makes a network call - a real
-OpenAI-backed run only starts when a case is actually submitted, and that
-is where real API usage/cost occurs. `OPENAI_API_KEY` (and optionally
-`OPENAI_MODEL`) can come from a local `.env`, or - for a future deployment -
-from `st.secrets`; either way, the value is copied into the process
-environment only, never logged, rendered, or stored in graph state.
+Each browser session owns its own graph/checkpointer/store in
+`st.session_state` - never behind a global cache - so unrelated sessions can
+never see or mutate each other's simulated state, and none of it survives a
+browser reload or server restart.
 
-What the demo exercises, using the real production workflow:
+## Tech Stack
 
-- a synthetic-customer selector and a free-text customer message, submitted
-  through a form (`▶️ Ejecutar caso`) - nothing invokes the workflow on
-  every keystroke;
-- safe actions (cancel, address change) executing directly and showing the
-  grounded `final_response` exactly as the graph produced it - the UI never
-  regenerates or edits it;
-- sensitive actions (refund, billing investigation, product investigation)
-  pausing at a real LangGraph `interrupt()`, rendering only the public
-  `ApprovalRequest` fields (action, order, amount, currency, message - never
-  customer email/address or full state), with **Aprobar**/**Rechazar**
-  buttons that resume the SAME `thread_id` via `Command(resume=...)` -
-  execution happens exactly once, only after an explicit "approved"
-  decision;
-- a "Detalles del workflow" expander (intent, urgency, selected order,
-  order resolution, policy outcome/reason, route, proposed action, human
-  decision, workflow status) and a "Registro de auditoría" expander
-  (the existing PII-free `audit_log`, rendered as-is);
-- sidebar example scenarios (order status, safe cancellation, address
-  change, refund/billing/product approval, blocked cancellation) that only
-  populate the customer/message fields - they never alter workflow
-  behavior and are not referenced anywhere in production logic;
-- a **Nuevo caso** control that discards the active runtime and starts the
-  next case from a completely fresh simulated store/checkpointer.
-
-Session and persistence model (see `customer_ops/demo_runtime.py`): each
-browser session owns its own graph, `InMemorySaver`, and
-`InMemoryCustomerActionStore`, held only in `st.session_state` - never
-behind a global cache, so unrelated sessions can never see or mutate each
-other's simulated state. Each new case gets an equally fresh runtime, so
-one demo case's mutations never affect the next. None of this is durable:
-a browser reload or a server restart loses the active case and every
-simulated mutation, by design - "New case" intentionally starts over from
-the original synthetic fixtures, not from a saved snapshot.
-
-## Tech stack
-
-- Python 3.13+
-- [LangGraph](https://github.com/langchain-ai/langgraph) `>=1.1,<2.0` for
-  orchestration, including `interrupt()`/`Command(resume=...)` for
-  human-in-the-loop and `InMemorySaver` (from `langgraph-checkpoint`,
-  already a LangGraph dependency) for demo/development checkpointing
-- [OpenAI SDK](https://github.com/openai/openai-python) `>=3.0,<4.0`, used via
-  the Responses API structured-output path (`responses.parse`)
-- [Pydantic](https://github.com/pydantic/pydantic) `>=2.0,<3.0`
-- [python-dotenv](https://github.com/theskumar/python-dotenv) for local
-  environment configuration
-- [Streamlit](https://github.com/streamlit/streamlit) `>=1.63,<2.0` for the
-  portfolio demo UI (`streamlit_app.py`), including
+- Python 3.13
+- [LangGraph](https://github.com/langchain-ai/langgraph) - orchestration,
+  `interrupt()`/`Command(resume=...)`, `InMemorySaver` checkpointing
+- [OpenAI SDK](https://github.com/openai/openai-python) - Responses API
+  structured outputs (`responses.parse`)
+- [Pydantic](https://github.com/pydantic/pydantic) - data contracts
+  throughout
+- [Streamlit](https://github.com/streamlit/streamlit) - the demo UI, and
   `streamlit.testing.v1.AppTest` for offline UI tests
-- [pytest](https://github.com/pytest-dev/pytest) for testing
+- [python-dotenv](https://github.com/theskumar/python-dotenv) - local
+  environment configuration
+- [pytest](https://github.com/pytest-dev/pytest) - the offline test suite
+- JSON synthetic fixture data (`data/customers.json`, `data/orders.json`)
 
-## Project structure
+## Project Structure
 
 ```
 ai-customer-operations-agent/
 │
 ├── customer_ops/
-│   ├── __init__.py
-│   ├── state.py            # CustomerOpsState, AuditEvent, OrderContext, controlled vocabularies
-│   ├── models.py           # CustomerRecord, OrderItem, OrderRecord (Pydantic data contracts)
-│   ├── classifier.py       # ClassificationDecision, RequestClassifier, OpenAIRequestClassifier
-│   ├── order_resolution.py # OrderResolution, resolve_order() - deterministic order selection
-│   ├── policies.py         # PolicyAssessment, evaluate_policy() - deterministic Mercora rules
-│   ├── routing.py          # determine_case_route() - deterministic branch selection
-│   ├── action_proposal.py  # ProposedAction, propose_action() - structured action intent
-│   ├── action_inputs.py    # ActionInputResult, prepare_action_input(), address extraction
-│   ├── action_executor.py  # ActionResult, execute_action() - one simulated mutation call
-│   ├── approval.py         # ApprovalRequest, HumanApprovalResponse - HITL contracts
-│   ├── response_generator.py # CustomerResponse, ResponseContext, build_response_context()
-│   ├── graph.py            # all graph nodes, build_customer_ops_graph()
-│   └── demo_runtime.py     # DemoRuntime, create/start/resume_demo_case() - UI-agnostic
+│   ├── state.py             # CustomerOpsState, AuditEvent, controlled vocabularies
+│   ├── models.py             # CustomerRecord, OrderItem, OrderRecord
+│   ├── classifier.py         # RequestClassifier, OpenAIRequestClassifier
+│   ├── order_resolution.py   # deterministic order selection
+│   ├── policies.py           # deterministic Mercora business rules
+│   ├── routing.py            # deterministic branch selection
+│   ├── action_proposal.py    # structured action intent
+│   ├── action_inputs.py      # validated execution input + address extraction
+│   ├── action_executor.py    # one simulated mutation call
+│   ├── approval.py           # ApprovalRequest / HumanApprovalResponse (HITL)
+│   ├── response_generator.py # grounded final-response generation
+│   ├── graph.py               # all graph nodes, build_customer_ops_graph()
+│   └── demo_runtime.py        # UI-agnostic Streamlit runtime helpers
 │
 ├── tools/
-│   ├── __init__.py
-│   ├── customer_data.py    # CustomerOperationsStore, JsonCustomerOperationsStore (read-only)
-│   └── action_store.py     # CustomerActionStore, InMemoryCustomerActionStore (simulated mutation)
+│   ├── customer_data.py      # read-only CustomerOperationsStore
+│   └── action_store.py       # simulated mutable CustomerActionStore
 │
 ├── data/
-│   ├── customers.json      # synthetic Mercora customers
-│   └── orders.json         # synthetic Mercora orders
+│   ├── customers.json        # synthetic Mercora customers
+│   └── orders.json           # synthetic Mercora orders
 │
 ├── evals/
-│   ├── __init__.py
-│   ├── e2e_cases.py     # EndToEndEvalCase, E2E_CASES (the 20-case benchmark)
-│   ├── e2e_checks.py    # rule-based ComponentCheckResult check functions
-│   ├── e2e_runner.py    # run_single_case()/run_e2e_evals() - fresh graph per case
-│   └── run_e2e_evals.py # CLI: python -m evals.run_e2e_evals (real OpenAI calls)
+│   ├── e2e_cases.py          # the 20-case curated benchmark
+│   ├── e2e_checks.py         # rule-based, deterministic check functions
+│   ├── e2e_runner.py         # fresh graph per case, real interrupt/resume
+│   └── run_e2e_evals.py      # CLI: python -m evals.run_e2e_evals
 │
-├── tests/
-│   ├── __init__.py
-│   ├── conftest.py
-│   ├── test_state.py
-│   ├── test_models.py
-│   ├── test_customer_data.py
-│   ├── test_classifier.py
-│   ├── test_order_resolution.py
-│   ├── test_policies.py
-│   ├── test_routing.py
-│   ├── test_action_proposal.py
-│   ├── test_action_inputs.py
-│   ├── test_action_store.py
-│   ├── test_action_executor.py
-│   ├── test_approval.py
-│   ├── test_response_generator.py
-│   ├── test_graph.py
-│   ├── test_e2e_evals.py
-│   ├── test_demo_runtime.py
-│   └── test_streamlit_app.py
+├── tests/                    # offline pytest suite (one file per module)
 │
-├── streamlit_app.py      # Streamlit portfolio demo UI (see below)
-├── app.py                # minimal placeholder entry point
+├── docs/screenshots/        # real app screenshots (see its own README)
+├── .streamlit/config.toml  # minimal, verified Streamlit config
+├── streamlit_app.py        # the Streamlit portfolio demo
+├── app.py                  # minimal placeholder entry point
 ├── CLAUDE.md
 ├── README.md
 ├── requirements.txt
@@ -355,52 +256,120 @@ ai-customer-operations-agent/
 └── .gitignore
 ```
 
-## Setup
+## Local Setup
 
-Requires Python 3.13+. Run from PowerShell in the project root.
-
-```powershell
+```bash
 python -m venv .venv
-.\.venv\Scripts\pip install -r requirements.txt
 ```
 
-Copy `.env.example` to `.env` and set `OPENAI_API_KEY` to run the graph for
-real (i.e. invoke it without injecting fakes). No key is required to run the
-test suite — tests always inject a fake `RequestClassifier`, a fake/in-memory
-`CustomerOperationsStore`, a fake `ActionInputExtractor`, and a fake
-`CustomerResponseGenerator`, use a fresh `InMemorySaver` per test graph, and
-make no network calls:
+Activate it:
 
-```powershell
-Copy-Item .env.example .env
+```bash
+# Windows (PowerShell)
+.\.venv\Scripts\Activate.ps1
+
+# macOS/Linux
+source .venv/bin/activate
 ```
 
-## Running the placeholder entry point
+Install dependencies:
 
-```powershell
-.\.venv\Scripts\python app.py
+```bash
+python -m pip install -r requirements.txt
 ```
 
-## Tests
+Configure environment variables - copy `.env.example` to `.env` and set:
 
-```powershell
-.\.venv\Scripts\python -m pytest -q
+```
+OPENAI_API_KEY=your-key-here
+OPENAI_MODEL=gpt-5.6-luna   # optional, this is already the default
 ```
 
-This always runs fully offline - no `OPENAI_API_KEY` needed, no network
-calls made, including for `tests/test_e2e_evals.py`, `tests/test_demo_runtime.py`,
-and `tests/test_streamlit_app.py` (the last uses
-`streamlit.testing.v1.AppTest` to render `streamlit_app.py` and exercise its
-UI wiring without ever submitting a case, so the real OpenAI-backed path is
-never triggered by pytest).
+No key is required to run the test suite - it always injects fakes and
+makes no network calls.
 
-## Running the real end-to-end benchmark (optional, costs real API usage)
+Run the offline test suite:
 
-```powershell
-.\.venv\Scripts\python -m evals.run_e2e_evals
+```bash
+python -m pytest -q
 ```
 
-This is separate from `pytest` and is never run automatically. It requires
-a valid `OPENAI_API_KEY` in `.env` and makes real OpenAI API calls for all
-20 cases in the benchmark. See [End-to-End Evaluation](#end-to-end-evaluation)
-above for what it checks and for the latest reviewed result.
+Run the placeholder CLI entry point (prints a pointer to the real demo):
+
+```bash
+python app.py
+```
+
+Run the Streamlit demo:
+
+```bash
+streamlit run streamlit_app.py
+```
+
+Run the real end-to-end benchmark (optional):
+
+```bash
+python -m evals.run_e2e_evals
+```
+
+**Warning:** this command makes real OpenAI API calls for all 20 benchmark
+cases and consumes real API usage/cost. It is never run by `pytest` and
+must be run manually, deliberately, after reviewing the code.
+
+## Deployment
+
+Manual deployment to Streamlit Community Cloud:
+
+1. Push the repository to GitHub (already at
+   `fernandezulises66-svg/ai-customer-operations-agent`).
+2. In Streamlit Community Cloud, create/select the app for that repository.
+3. **Branch:** `main`
+4. **Main file path:** `streamlit_app.py`
+5. In **Advanced settings**:
+   - select **Python 3.13**
+   - add secrets:
+     ```toml
+     OPENAI_API_KEY = "<real key>"
+     OPENAI_MODEL = "gpt-5.6-luna"
+     ```
+6. Deploy.
+7. Run the manual public smoke tests (see below) before sharing the link.
+
+Never commit real secrets to this repository - `.env`, `.env.*`, and
+`.streamlit/secrets.toml` are all gitignored, and Streamlit Community Cloud
+secrets are configured only in its own dashboard.
+
+## Limitations
+
+- All company/customer/order data is synthetic - Mercora does not exist.
+- Every operational action is simulated - no real payment, shipping, or CRM
+  system is ever contacted.
+- Business-state mutations live only in an in-memory store for the current
+  process/session.
+- `InMemorySaver` checkpointing is not durable - a server restart loses
+  every active case.
+- **New case** intentionally resets to the original synthetic fixtures -
+  it does not restore a saved snapshot.
+- There are no real integrations (payments, logistics, CRM); this is a
+  demonstration of orchestration and guardrail design, not an integrated
+  system.
+- The evaluation benchmark is a small, curated set (20 cases) - it
+  demonstrates coverage of this project's own decision points, not
+  statistical accuracy at scale.
+- The model-backed components (classification, address extraction, final
+  response) can vary between runs; the rest of the workflow is fully
+  deterministic.
+
+## Future Production Work
+
+Not implemented here - listed to be explicit about scope, not as a roadmap
+promise:
+
+- a durable checkpoint/business-state backend (a real database, not
+  `InMemorySaver`)
+- authenticated reviewer identity for the approval step
+- real transactional integrations (payments, shipping, CRM)
+- idempotency guarantees across durable action execution
+- authorization / multi-tenant isolation
+- production monitoring and telemetry
+- a larger, more representative evaluation set

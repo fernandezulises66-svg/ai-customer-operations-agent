@@ -138,8 +138,8 @@ class CustomerOpsState(TypedDict):
     """Shared state threaded through the Mercora customer operations graph.
 
     `request_id`, `customer_id`, and `customer_message` are the required
-    initial payload. Every other field is populated progressively by nodes
-    added in later iterations and starts unset.
+    initial payload. Every other field starts unset and is populated
+    progressively as the graph nodes run.
     """
 
     # Initial request payload

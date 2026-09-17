@@ -177,8 +177,10 @@ st.caption(
 )
 st.info(
     "🧪 Esto es una demo de portafolio. Mercora, los clientes y los pedidos son "
-    "ficticios/sintéticos. Ninguna acción mueve dinero real ni contacta sistemas "
-    "externos reales.",
+    "ficticios/sintéticos, y toda acción operativa (cancelaciones, cambios de "
+    "dirección, reembolsos, investigaciones) es simulada: ninguna mueve dinero "
+    "real ni contacta sistemas externos reales. Ejecutar un caso sí realiza "
+    "llamadas reales a la API de OpenAI.",
     icon="🧪",
 )
 

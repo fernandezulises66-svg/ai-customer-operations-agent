@@ -1,0 +1,15 @@
+# Minimal, verified Streamlit configuration for the public portfolio demo.
+#
+# `client.showErrorDetails = "none"` is a genuine, currently-supported
+# config value in the Streamlit version this project targets (verified
+# against the installed streamlit.config module before adding this file) -
+# it suppresses Streamlit's own built-in traceback/exception display for
+# any uncaught error, as defense-in-depth alongside this app's own
+# allowlisted error messages (see streamlit_app.py's _safe_error_message).
+#
+# This file contains no secrets. Real credentials belong in
+# .streamlit/secrets.toml (gitignored) or Streamlit Community Cloud's
+# "Secrets" settings - never here.
+
+[client]
+showErrorDetails = "none"

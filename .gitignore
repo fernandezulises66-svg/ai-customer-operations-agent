@@ -1,6 +1,11 @@
 # Environment
 .env
+.env.*
+!.env.example
 .venv/
+
+# Streamlit secrets (never commit real credentials; config.toml is safe to keep)
+.streamlit/secrets.toml
 
 # Python
 __pycache__/

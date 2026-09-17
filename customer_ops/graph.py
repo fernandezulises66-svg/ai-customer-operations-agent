@@ -12,8 +12,7 @@ Mercora business rules against the resolved order.
 After policy evaluation, a genuine LangGraph conditional edge - driven only
 by structured state, never an LLM call - routes to one of five branches:
 
-- `clarification` / `information` / `blocked` are terminal, exactly as in
-  Iteration 5.
+- `clarification` / `information` / `blocked` are terminal branches.
 - `action` (safe: cancel_order, address_change) additionally prepares
   validated execution input (`prepare_action_input`, model-backed only for
   `change_address`) and then, via a second conditional edge, either
