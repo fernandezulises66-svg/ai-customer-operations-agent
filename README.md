@@ -3,9 +3,10 @@
 **Status: intake + classification + context loading + deterministic order
 resolution, policy evaluation, conditional routing, structured action
 proposals, simulated safe-action execution, human-in-the-loop approval with
-LangGraph checkpointing, final customer-facing response generation, and a
-curated end-to-end evaluation benchmark (Iteration 9).** This is a
-portfolio project and is not production software.
+LangGraph checkpointing, final customer-facing response generation, a
+curated end-to-end evaluation benchmark, and a Streamlit human-in-the-loop
+demo (Iteration 10).** This is a portfolio project and is not production
+software.
 
 > Mercora is a fictional e-commerce company invented for this project. All
 > customers, orders, policies, payments, addresses, and tickets referenced
@@ -143,7 +144,6 @@ business storage.
 
 Planned later (not implemented yet):
 
-- Streamlit UI.
 - Deployment.
 - Durable checkpoint/business-data persistence (a future improvement beyond
   `InMemorySaver`).
@@ -203,15 +203,73 @@ make it pass.
   overall pass rate, ending with a disclaimer that these metrics describe
   only this curated benchmark, not general model accuracy or production
   reliability.
-- **No benchmark results are published in this README yet** - the real
-  benchmark (`python -m evals.run_e2e_evals`) has not been run as part of
-  this iteration, only validated offline against fake dependencies.
+- **Latest reviewed real-benchmark result** (`python -m evals.run_e2e_evals`,
+  run manually and reviewed, not run by pytest or by this iteration):
+  20 cases, 20/20 passed, all structured workflow metrics at 100%, response
+  fact-check at 100%. **These results apply only to this curated benchmark
+  and are not claims of general model accuracy or production reliability.**
+  Results can vary across runs, since three of the ten workflow components
+  are model-backed - see `evals/run_e2e_evals.py` for the same disclaimer
+  printed after every run.
 
 `tests/test_e2e_evals.py` tests this framework's own logic - fully
 offline, using synthetic cases and fake classifier/extractor/response-
 generator dependencies (never the real 20-case benchmark, never a real
 OpenAI call). See [Tests](#tests) below for how to run the full pytest
 suite, which remains 100% offline.
+
+## Streamlit Demo
+
+`streamlit_app.py` is a portfolio-facing, Spanish-first UI around the exact
+workflow described above - it adds no new business logic, and does not
+change policy/routing/action-execution behavior.
+
+```powershell
+.\.venv\Scripts\streamlit run streamlit_app.py
+```
+
+Loading the page never calls OpenAI or makes a network call - a real
+OpenAI-backed run only starts when a case is actually submitted, and that
+is where real API usage/cost occurs. `OPENAI_API_KEY` (and optionally
+`OPENAI_MODEL`) can come from a local `.env`, or - for a future deployment -
+from `st.secrets`; either way, the value is copied into the process
+environment only, never logged, rendered, or stored in graph state.
+
+What the demo exercises, using the real production workflow:
+
+- a synthetic-customer selector and a free-text customer message, submitted
+  through a form (`▶️ Ejecutar caso`) - nothing invokes the workflow on
+  every keystroke;
+- safe actions (cancel, address change) executing directly and showing the
+  grounded `final_response` exactly as the graph produced it - the UI never
+  regenerates or edits it;
+- sensitive actions (refund, billing investigation, product investigation)
+  pausing at a real LangGraph `interrupt()`, rendering only the public
+  `ApprovalRequest` fields (action, order, amount, currency, message - never
+  customer email/address or full state), with **Aprobar**/**Rechazar**
+  buttons that resume the SAME `thread_id` via `Command(resume=...)` -
+  execution happens exactly once, only after an explicit "approved"
+  decision;
+- a "Detalles del workflow" expander (intent, urgency, selected order,
+  order resolution, policy outcome/reason, route, proposed action, human
+  decision, workflow status) and a "Registro de auditoría" expander
+  (the existing PII-free `audit_log`, rendered as-is);
+- sidebar example scenarios (order status, safe cancellation, address
+  change, refund/billing/product approval, blocked cancellation) that only
+  populate the customer/message fields - they never alter workflow
+  behavior and are not referenced anywhere in production logic;
+- a **Nuevo caso** control that discards the active runtime and starts the
+  next case from a completely fresh simulated store/checkpointer.
+
+Session and persistence model (see `customer_ops/demo_runtime.py`): each
+browser session owns its own graph, `InMemorySaver`, and
+`InMemoryCustomerActionStore`, held only in `st.session_state` - never
+behind a global cache, so unrelated sessions can never see or mutate each
+other's simulated state. Each new case gets an equally fresh runtime, so
+one demo case's mutations never affect the next. None of this is durable:
+a browser reload or a server restart loses the active case and every
+simulated mutation, by design - "New case" intentionally starts over from
+the original synthetic fixtures, not from a saved snapshot.
 
 ## Tech stack
 
@@ -225,6 +283,9 @@ suite, which remains 100% offline.
 - [Pydantic](https://github.com/pydantic/pydantic) `>=2.0,<3.0`
 - [python-dotenv](https://github.com/theskumar/python-dotenv) for local
   environment configuration
+- [Streamlit](https://github.com/streamlit/streamlit) `>=1.63,<2.0` for the
+  portfolio demo UI (`streamlit_app.py`), including
+  `streamlit.testing.v1.AppTest` for offline UI tests
 - [pytest](https://github.com/pytest-dev/pytest) for testing
 
 ## Project structure
@@ -245,7 +306,8 @@ ai-customer-operations-agent/
 │   ├── action_executor.py  # ActionResult, execute_action() - one simulated mutation call
 │   ├── approval.py         # ApprovalRequest, HumanApprovalResponse - HITL contracts
 │   ├── response_generator.py # CustomerResponse, ResponseContext, build_response_context()
-│   └── graph.py            # all graph nodes, build_customer_ops_graph()
+│   ├── graph.py            # all graph nodes, build_customer_ops_graph()
+│   └── demo_runtime.py     # DemoRuntime, create/start/resume_demo_case() - UI-agnostic
 │
 ├── tools/
 │   ├── __init__.py
@@ -280,8 +342,11 @@ ai-customer-operations-agent/
 │   ├── test_approval.py
 │   ├── test_response_generator.py
 │   ├── test_graph.py
-│   └── test_e2e_evals.py
+│   ├── test_e2e_evals.py
+│   ├── test_demo_runtime.py
+│   └── test_streamlit_app.py
 │
+├── streamlit_app.py      # Streamlit portfolio demo UI (see below)
 ├── app.py                # minimal placeholder entry point
 ├── CLAUDE.md
 ├── README.md
@@ -323,7 +388,11 @@ Copy-Item .env.example .env
 ```
 
 This always runs fully offline - no `OPENAI_API_KEY` needed, no network
-calls made, including for `tests/test_e2e_evals.py`.
+calls made, including for `tests/test_e2e_evals.py`, `tests/test_demo_runtime.py`,
+and `tests/test_streamlit_app.py` (the last uses
+`streamlit.testing.v1.AppTest` to render `streamlit_app.py` and exercise its
+UI wiring without ever submitting a case, so the real OpenAI-backed path is
+never triggered by pytest).
 
 ## Running the real end-to-end benchmark (optional, costs real API usage)
 
@@ -334,4 +403,4 @@ calls made, including for `tests/test_e2e_evals.py`.
 This is separate from `pytest` and is never run automatically. It requires
 a valid `OPENAI_API_KEY` in `.env` and makes real OpenAI API calls for all
 20 cases in the benchmark. See [End-to-End Evaluation](#end-to-end-evaluation)
-above for what it checks and why no results are published here yet.
+above for what it checks and for the latest reviewed result.

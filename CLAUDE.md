@@ -165,6 +165,37 @@ Guidance for Claude Code (and any future contributor) working in this repository
   model-backed run - that real run belongs in a separate, explicitly manual
   entry point (e.g. a `python -m` CLI), never invoked by pytest.
 
+## Streamlit demo
+
+- The mutable Streamlit workflow runtime (graph, checkpointer, simulated
+  action store) must be isolated per browser session - held in
+  `st.session_state`, never behind a global/shared cache (e.g.
+  `@st.cache_resource`) - so unrelated users can never see or mutate each
+  other's simulated business state.
+- A Streamlit rerun must not reconstruct active human-in-the-loop state
+  (the graph, its thread_id, a pending interrupt payload) or re-invoke/
+  resume the graph on its own - only an explicit user action (submitting a
+  case, clicking Approve/Reject) may do that.
+- A new demo case intentionally starts from a fresh simulated store/
+  checkpointer/thread_id, not from the previous case's mutated state -
+  reproducibility for a public demo matters more here than continuity.
+- The UI is a renderer and input surface only - it must never independently
+  decide intent, policy, routing, order selection, approval, or execution
+  outcomes, and must never regenerate/edit the graph-produced
+  `final_response`.
+- The UI must never replay or re-trigger an action on rerender; execution
+  happens only inside the graph, only once, only in response to an
+  explicit user event.
+- Only the public `ApprovalRequest` payload (from the real `interrupt()`)
+  may be shown to a reviewer in the UI - never customer email/address,
+  full `CustomerOpsState`, or checkpointer internals.
+- The UI must never render a raw exception message (`str(exc)`) or
+  traceback - map caught exceptions to a small set of allowlisted, generic,
+  user-safe messages by exception TYPE (`isinstance` checks), never by
+  inspecting message content. Raw exception text can embed provider/request
+  details, configuration values, or other internals that must never reach a
+  public demo.
+
 ## Scope control
 
 - Implement only the requirements of the current iteration.

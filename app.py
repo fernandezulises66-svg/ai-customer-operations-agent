@@ -1,13 +1,14 @@
 """Placeholder entry point for the Mercora Customer Operations Agent.
 
-This iteration only establishes the project foundation. There is no CLI, no
-interactive loop, and no OpenAI call here yet.
+There is no CLI or interactive loop here, and this file makes no OpenAI
+call. The portfolio-facing entry point is the Streamlit demo - run it with
+`streamlit run streamlit_app.py` (see README.md).
 """
 
 
 def main() -> None:
-    print("AI Customer Operations Agent (Mercora) - foundation initialized.")
-    print("Iteration 8: + final customer-facing response generation.")
+    print("AI Customer Operations Agent (Mercora).")
+    print("Run 'streamlit run streamlit_app.py' for the interactive demo.")
 
 
 if __name__ == "__main__":
